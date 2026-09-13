@@ -1,198 +1,596 @@
-const SFTP = require('ssh2-sftp-client');
+const SFTP = require("ssh2-sftp-client");
 
-const { XMLParser } = require('fast-xml-parser');
+const { XMLParser } = require("fast-xml-parser");
 
-const required = ['TROPICANA_SFTP_USER','TROPICANA_SFTP_PASSWORD','SHOPIFY_CLIENT_ID','SHOPIFY_CLIENT_SECRET','SHOPIFY_STORE_DOMAIN'];
+const required = [
 
-for (const key of required) if (!process.env[key]) throw new Error(`Missing ${key}`);
+  "TROPICANA_SFTP_USER",
+
+  "TROPICANA_SFTP_PASSWORD",
+
+  "SHOPIFY_CLIENT_ID",
+
+  "SHOPIFY_CLIENT_SECRET",
+
+  "SHOPIFY_STORE_DOMAIN"
+
+];
+
+for (const key of required) {
+
+  if (!process.env[key]) throw new Error(`Missing ${key}`);
+
+}
 
 const shop = process.env.SHOPIFY_STORE_DOMAIN;
 
-const apiVersion = '2026-07';
+const apiVersion = "2026-07";
 
-const locationId = 'gid://shopify/Location/120937251150';
+const locationId = "gid://shopify/Location/120937251150";
 
 async function token() {
 
-  const body = new URLSearchParams({grant_type:'client_credentials',client_id:process.env.SHOPIFY_CLIENT_ID,client_secret:process.env.SHOPIFY_CLIENT_SECRET});
+  const body = new URLSearchParams({
 
-  const r = await fetch(`https://${shop}/admin/oauth/access_token`, {method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body});
+    grant_type: "client_credentials",
 
-  if (!r.ok) throw new Error(`Shopify token failed ${r.status}: ${await r.text()}`);
+    client_id: process.env.SHOPIFY_CLIENT_ID,
 
-  return (await r.json()).access_token;
+    client_secret: process.env.SHOPIFY_CLIENT_SECRET
 
-}
+  });
 
-async function gql(accessToken, query, variables={}) {
+  const response = await fetch(
 
-  const r = await fetch(`https://${shop}/admin/api/${apiVersion}/graphql.json`, {method:'POST',headers:{'content-type':'application/json','x-shopify-access-token':accessToken},body:JSON.stringify({query,variables})});
+    `https://${shop}/admin/oauth/access_token`,
 
-  const j = await r.json();
+    {
 
-  if (!r.ok || j.errors) throw new Error(`Shopify GraphQL failed: ${JSON.stringify(j.errors || j)}`);
+      method: "POST",
 
-  return j.data;
+      headers: {
 
-}
+        "content-type": "application/x-www-form-urlencoded"
 
-function records(node, out=[]) {
+      },
 
-  if (Array.isArray(node)) for (const v of node) records(v,out);
+      body
 
-  else if (node && typeof node === 'object') {
+    }
 
-    if (Object.prototype.hasOwnProperty.call(node,'ProductCode')) out.push(node);
+  );
 
-    for (const v of Object.values(node)) records(v,out);
+  if (!response.ok) {
+
+    throw new Error(
+
+      `Shopify token failed ${response.status}: ${await response.text()}`
+
+    );
 
   }
 
-  return out;
+  return (await response.json()).access_token;
+
+}
+
+async function gql(accessToken, query, variables = {}) {
+
+  const response = await fetch(
+
+    `https://${shop}/admin/api/${apiVersion}/graphql.json`,
+
+    {
+
+      method: "POST",
+
+      headers: {
+
+        "content-type": "application/json",
+
+        "x-shopify-access-token": accessToken
+
+      },
+
+      body: JSON.stringify({ query, variables })
+
+    }
+
+  );
+
+  const result = await response.json();
+
+  if (!response.ok || result.errors) {
+
+    throw new Error(
+
+      `Shopify GraphQL failed: ${JSON.stringify(result.errors || result)}`
+
+    );
+
+  }
+
+  return result.data;
+
+}
+
+function records(node, output = []) {
+
+  if (Array.isArray(node)) {
+
+    for (const value of node) records(value, output);
+
+  } else if (node && typeof node === "object") {
+
+    if (Object.prototype.hasOwnProperty.call(node, "ProductCode")) {
+
+      output.push(node);
+
+    }
+
+    for (const value of Object.values(node)) records(value, output);
+
+  }
+
+  return output;
 
 }
 
 function feedQuantity(row) {
 
-  const keys = ['StockLevel','StockQuantity','StockQty','FreeStock','AvailableStock','QuantityAvailable','AvailableQuantity','QtyInStock'];
+  const keys = [
 
-  const present = keys.filter(k => Object.prototype.hasOwnProperty.call(row,k));
+    "StockLevel",
 
-  if (present.length !== 1) throw new Error(`Unsafe stock fields for ${row.ProductCode}: ${present.join(',') || 'none'}; keys=${Object.keys(row).join(',')}`);
+    "StockQuantity",
+
+    "StockQty",
+
+    "FreeStock",
+
+    "AvailableStock",
+
+    "QuantityAvailable",
+
+    "AvailableQuantity",
+
+    "QtyInStock"
+
+  ];
+
+  const present = keys.filter(key =>
+
+    Object.prototype.hasOwnProperty.call(row, key)
+
+  );
+
+  if (present.length !== 1) {
+
+    throw new Error(
+
+      `Unsafe stock fields for ${row.ProductCode}: ` +
+
+      `${present.join(",") || "none"}; ` +
+
+      `keys=${Object.keys(row).join(",")}`
+
+    );
+
+  }
 
   const raw = String(row[present[0]]).trim();
 
   if (/^(out\s*of\s*stock|no|false|none)$/i.test(raw)) return 0;
 
-  if (!/^-?\d+(?:\.0+)?$/.test(raw)) throw new Error(`Invalid quantity for ${row.ProductCode}: field=${present[0]} value=${JSON.stringify(raw)}`);
+  if (!/^-?\d+(?:\.0+)?$/.test(raw)) {
 
-  const n = Number(raw);
+    throw new Error(
 
-  if (!Number.isSafeInteger(n) || n > 1000000) throw new Error(`Invalid quantity for ${row.ProductCode}: field=${present[0]} value=${JSON.stringify(raw)}`);
+      `Invalid quantity for ${row.ProductCode}: ` +
 
-  if (n < 0) {
+      `field=${present[0]} value=${JSON.stringify(raw)}`
 
-    console.warn(`NEGATIVE_STOCK_CLAMPED ${row.ProductCode} ${n}->0`);
+    );
+
+  }
+
+  const quantity = Number(raw);
+
+  if (!Number.isSafeInteger(quantity) || quantity > 1000000) {
+
+    throw new Error(
+
+      `Invalid quantity for ${row.ProductCode}: ` +
+
+      `field=${present[0]} value=${JSON.stringify(raw)}`
+
+    );
+
+  }
+
+  if (quantity < 0) {
+
+    console.warn(
+
+      `NEGATIVE_STOCK_CLAMPED ${row.ProductCode} ${quantity}->0`
+
+    );
 
     return 0;
 
   }
 
-  return n;
+  return quantity;
 
 }
 
 async function supplierFeed() {
 
-  const s = new SFTP();
+  const sftp = new SFTP();
 
   try {
 
-    await s.connect({host:'tropicana.ftp.redtechnology.com',port:22,username:process.env.TROPICANA_SFTP_USER,password:process.env.TROPICANA_SFTP_PASSWORD,readyTimeout:30000});
+    await sftp.connect({
 
-    const b = await s.get('DropshipProductFeed.xml');
+      host: "tropicana.ftp.redtechnology.com",
 
-    const parsed = new XMLParser({trimValues:true,parseTagValue:false}).parse(b.toString());
+      port: 22,
+
+      username: process.env.TROPICANA_SFTP_USER,
+
+      password: process.env.TROPICANA_SFTP_PASSWORD,
+
+      readyTimeout: 30000
+
+    });
+
+    const buffer = await sftp.get("DropshipProductFeed.xml");
+
+    const parsed = new XMLParser({
+
+      trimValues: true,
+
+      parseTagValue: false
+
+    }).parse(buffer.toString());
 
     const rows = records(parsed);
 
-    const map = new Map(), duplicates = new Set();
+    const stockBySku = new Map();
+
+    const duplicateSkus = new Set();
 
     for (const row of rows) {
 
-      const sku = String(row.ProductCode ?? '').trim();
+      const sku = String(row.ProductCode ?? "").trim();
 
       if (!sku) continue;
 
-      const qty = feedQuantity(row);
+      const quantity = feedQuantity(row);
 
-      if (map.has(sku)) duplicates.add(sku); else map.set(sku,qty);
+      if (stockBySku.has(sku)) {
+
+        duplicateSkus.add(sku);
+
+      } else {
+
+        stockBySku.set(sku, quantity);
+
+      }
 
     }
 
-    for (const sku of duplicates) map.delete(sku);
+    for (const sku of duplicateSkus) {
 
-    console.log(`FEED_OK rows=${rows.length} unique=${map.size} duplicate_codes_blocked=${duplicates.size}`);
+      stockBySku.delete(sku);
 
-    return map;
+    }
 
-  } finally { try { await s.end(); } catch {} }
+    console.log(
+
+      `FEED_OK rows=${rows.length} ` +
+
+      `unique=${stockBySku.size} ` +
+
+      `duplicate_codes_blocked=${duplicateSkus.size}`
+
+    );
+
+    return stockBySku;
+
+  } finally {
+
+    try {
+
+      await sftp.end();
+
+    } catch {}
+
+  }
 
 }
 
 async function variants(accessToken) {
 
-  const query = `query Variants($after:String){productVariants(first:100,after:$after){nodes{id sku inventoryQuantity inventoryItem{id} product{id status}} pageInfo{hasNextPage endCursor}}}`;
+  const query = `
 
-  const all=[]; let after=null;
+    query Variants($after: String, $locationId: ID!) {
+
+      productVariants(first: 100, after: $after) {
+
+        nodes {
+
+          id
+
+          sku
+
+          inventoryItem {
+
+            id
+
+            inventoryLevel(locationId: $locationId) {
+
+              quantities(names: ["available"]) {
+
+                name
+
+                quantity
+
+              }
+
+            }
+
+          }
+
+          product {
+
+            id
+
+            status
+
+          }
+
+        }
+
+        pageInfo {
+
+          hasNextPage
+
+          endCursor
+
+        }
+
+      }
+
+    }
+
+  `;
+
+  const allVariants = [];
+
+  let after = null;
 
   do {
 
-    const d=await gql(accessToken,query,{after});
+    const data = await gql(accessToken, query, {
 
-    all.push(...d.productVariants.nodes);
+      after,
 
-    after=d.productVariants.pageInfo.hasNextPage?d.productVariants.pageInfo.endCursor:null;
+      locationId
 
-  } while(after);
+    });
 
-  return all;
+    allVariants.push(...data.productVariants.nodes);
 
-}
+    after = data.productVariants.pageInfo.hasNextPage
 
-async function setQuantity(accessToken, item, quantity, compareQuantity) {
+      ? data.productVariants.pageInfo.endCursor
 
-  const mutation=`mutation SetInventory($input:InventorySetQuantitiesInput!,$key:String!){inventorySetQuantities(input:$input) @idempotent(key:$key){inventoryAdjustmentGroup{changes{name delta quantityAfterChange}} userErrors{field message}}}`;
+      : null;
 
-  const input={name:'available',reason:'correction',referenceDocumentUri:`gid://ppl-tropicana-sync/StockSync/${Date.now()}`,quantities:[{inventoryItemId:item,locationId,quantity,changeFromQuantity:compareQuantity}]};
+  } while (after);
 
-  const d=await gql(accessToken,mutation,{input,key:crypto.randomUUID()});
-
-  const errs=d.inventorySetQuantities.userErrors;
-
-  if(errs.length) throw new Error(JSON.stringify(errs));
-
-  const check=`query ReadBack($id:ID!){inventoryItem(id:$id){variants(first:1){nodes{inventoryQuantity}}}}`;
-
-  const read=await gql(accessToken,check,{id:item});
-
-  const actual=read.inventoryItem.variants.nodes[0]?.inventoryQuantity;
-
-  if(actual!==quantity) throw new Error(`Read-back mismatch expected=${quantity} got=${actual}`);
+  return allVariants;
 
 }
 
-(async()=>{
+async function setQuantity(
 
-  const feed=await supplierFeed();
+  accessToken,
 
-  const accessToken=await token();
+  inventoryItemId,
 
-  const all=await variants(accessToken);
+  quantity,
 
-  const bySku=new Map();
+  currentQuantity
 
-  for(const v of all){
+) {
 
-    const sku=(v.sku||'').trim();
+  const mutation = `
 
-    if(!sku||!feed.has(sku))continue;
+    mutation SetInventory(
 
-    if(!bySku.has(sku))bySku.set(sku,[]);
+      $input: InventorySetQuantitiesInput!,
 
-    bySku.get(sku).push(v);
+      $key: String!
+
+    ) {
+
+      inventorySetQuantities(input: $input)
+
+        @idempotent(key: $key) {
+
+        inventoryAdjustmentGroup {
+
+          changes {
+
+            name
+
+            delta
+
+            quantityAfterChange
+
+          }
+
+        }
+
+        userErrors {
+
+          field
+
+          message
+
+        }
+
+      }
+
+    }
+
+  `;
+
+  const input = {
+
+    name: "available",
+
+    reason: "correction",
+
+    referenceDocumentUri:
+
+      `gid://ppl-tropicana-sync/StockSync/${Date.now()}`,
+
+    quantities: [
+
+      {
+
+        inventoryItemId,
+
+        locationId,
+
+        quantity,
+
+        changeFromQuantity: currentQuantity
+
+      }
+
+    ]
+
+  };
+
+  const data = await gql(accessToken, mutation, {
+
+    input,
+
+    key: crypto.randomUUID()
+
+  });
+
+  const errors = data.inventorySetQuantities.userErrors;
+
+  if (errors.length) {
+
+    throw new Error(JSON.stringify(errors));
 
   }
 
-  let changed=0,unchanged=0,blocked=0;
+  const checkQuery = `
 
-  for(const [sku,list] of bySku){
+    query ReadBack($id: ID!, $locationId: ID!) {
 
-    const active=list.filter(v=>v.product.status==='ACTIVE');
+      inventoryItem(id: $id) {
 
-    if(active.length!==1){
+        inventoryLevel(locationId: $locationId) {
 
-      console.error(`BLOCKED sku=${sku} active_matches=${active.length}`);
+          quantities(names: ["available"]) {
+
+            name
+
+            quantity
+
+          }
+
+        }
+
+      }
+
+    }
+
+  `;
+
+  const readBack = await gql(accessToken, checkQuery, {
+
+    id: inventoryItemId,
+
+    locationId
+
+  });
+
+  const actualQuantity =
+
+    readBack.inventoryItem.inventoryLevel?.quantities?.find(
+
+      value => value.name === "available"
+
+    )?.quantity;
+
+  if (actualQuantity !== quantity) {
+
+    throw new Error(
+
+      `Read-back mismatch expected=${quantity} got=${actualQuantity}`
+
+    );
+
+  }
+
+}
+
+(async () => {
+
+  const feed = await supplierFeed();
+
+  const accessToken = await token();
+
+  const allVariants = await variants(accessToken);
+
+  const variantsBySku = new Map();
+
+  for (const variant of allVariants) {
+
+    const sku = (variant.sku || "").trim();
+
+    if (!sku || !feed.has(sku)) continue;
+
+    if (!variantsBySku.has(sku)) {
+
+      variantsBySku.set(sku, []);
+
+    }
+
+    variantsBySku.get(sku).push(variant);
+
+  }
+
+  let changed = 0;
+
+  let unchanged = 0;
+
+  let blocked = 0;
+
+  for (const [sku, matchingVariants] of variantsBySku) {
+
+    const activeVariants = matchingVariants.filter(
+
+      variant => variant.product.status === "ACTIVE"
+
+    );
+
+    if (activeVariants.length !== 1) {
+
+      console.error(
+
+        `BLOCKED sku=${sku} active_matches=${activeVariants.length}`
+
+      );
 
       blocked++;
 
@@ -200,11 +598,33 @@ async function setQuantity(accessToken, item, quantity, compareQuantity) {
 
     }
 
-    const v=active[0], current=v.inventoryQuantity;
+    const variant = activeVariants[0];
 
-    const wanted=feed.get(sku);
+    const currentQuantity =
 
-    if(current===wanted){
+      variant.inventoryItem.inventoryLevel?.quantities?.find(
+
+        value => value.name === "available"
+
+      )?.quantity;
+
+    if (!Number.isInteger(currentQuantity)) {
+
+      console.error(
+
+        `BLOCKED sku=${sku} location_quantity_unreadable`
+
+      );
+
+      blocked++;
+
+      continue;
+
+    }
+
+    const wantedQuantity = feed.get(sku);
+
+    if (currentQuantity === wantedQuantity) {
 
       unchanged++;
 
@@ -212,19 +632,45 @@ async function setQuantity(accessToken, item, quantity, compareQuantity) {
 
     }
 
-    await setQuantity(accessToken,v.inventoryItem.id,wanted,current);
+    await setQuantity(
 
-    console.log(`VERIFIED sku=${sku} from=${current} to=${wanted}`);
+      accessToken,
+
+      variant.inventoryItem.id,
+
+      wantedQuantity,
+
+      currentQuantity
+
+    );
+
+    console.log(
+
+      `VERIFIED sku=${sku} ` +
+
+      `from=${currentQuantity} to=${wantedQuantity}`
+
+    );
 
     changed++;
 
   }
 
-  console.log(`SYNC_COMPLETE changed=${changed} unchanged=${unchanged} blocked=${blocked} matched_skus=${bySku.size}`);
+  console.log(
 
-})().catch(e=>{
+    `SYNC_COMPLETE changed=${changed} ` +
 
-  console.error('SYNC_FAILED',e.stack||e);
+    `unchanged=${unchanged} ` +
+
+    `blocked=${blocked} ` +
+
+    `matched_skus=${variantsBySku.size}`
+
+  );
+
+})().catch(error => {
+
+  console.error("SYNC_FAILED", error.stack || error);
 
   process.exit(1);
 
