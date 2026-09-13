@@ -1,0 +1,17 @@
+{
+  "name": "ppl-tropicana-stock-sync",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Hourly exact-SKU Tropicana stock sync for Precision Performance Labs",
+  "main": "tropicana-stock-sync.js",
+  "scripts": {
+    "start": "node tropicana-stock-sync.js"
+  },
+  "dependencies": {
+    "fast-xml-parser": "5.2.5",
+    "ssh2-sftp-client": "12.1.1"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

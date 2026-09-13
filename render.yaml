@@ -1,0 +1,12 @@
+services:
+  - type: cron
+    name: ppl-tropicana-hourly-stock-sync
+    runtime: node
+    region: frankfurt
+    plan: starter
+    schedule: "0 * * * *"
+    buildCommand: npm install
+    startCommand: npm start
+    autoDeployTrigger: "off"
+    envVars:
+      - fromGroup: ppl-tropicana-sync-secrets
