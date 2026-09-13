@@ -35,8 +35,11 @@ function feedQuantity(row) {
   const keys = ['StockLevel','StockQuantity','StockQty','FreeStock','AvailableStock','QuantityAvailable','AvailableQuantity','QtyInStock'];
   const present = keys.filter(k => Object.prototype.hasOwnProperty.call(row,k));
   if (present.length !== 1) throw new Error(`Unsafe stock fields for ${row.ProductCode}: ${present.join(',') || 'none'}; keys=${Object.keys(row).join(',')}`);
-  const n = Number(String(row[present[0]]).trim());
-  if (!Number.isInteger(n) || n < 0 || n > 1000000) throw new Error(`Invalid quantity for ${row.ProductCode}`);
+  const raw = String(row[present[0]]).trim();
+  if (/^(out\s*of\s*stock|no|false|none)$/i.test(raw)) return 0;
+  if (!/^\d+(?:\.0+)?$/.test(raw)) throw new Error(`Invalid quantity for ${row.ProductCode}: field=${present[0]} value=${JSON.stringify(raw)}`);
+  const n = Number(raw);
+  if (!Number.isSafeInteger(n) || n < 0 || n > 1000000) throw new Error(`Invalid quantity for ${row.ProductCode}: field=${present[0]} value=${JSON.stringify(raw)}`);
   return n;
 }
 
