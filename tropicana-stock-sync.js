@@ -28,7 +28,7 @@ const shop = process.env.SHOPIFY_STORE_DOMAIN;
 
 const apiVersion = "2026-07";
 
-const locationId = "gid://shopify/Location/120937251150";
+const locationId = "gid://shopify/Location/125063037262";
 
 async function token() {
 
