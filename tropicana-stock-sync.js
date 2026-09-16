@@ -1,3 +1,5 @@
+
+You don't often get email from pplabs@yahoo.com. Learn why this is important
 const SFTP = require("ssh2-sftp-client");
 
 const { XMLParser } = require("fast-xml-parser");
@@ -26,7 +28,7 @@ const shop = process.env.SHOPIFY_STORE_DOMAIN;
 
 const apiVersion = "2026-07";
 
-const locationId = "gid://shopify/Location/125063037262";
+const locationId = "gid://shopify/Location/120937251150";
 
 async function token() {
 
