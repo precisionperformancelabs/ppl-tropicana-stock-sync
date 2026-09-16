@@ -1,5 +1,3 @@
-
-You don't often get email from pplabs@yahoo.com. Learn why this is important
 const SFTP = require("ssh2-sftp-client");
 
 const { XMLParser } = require("fast-xml-parser");
