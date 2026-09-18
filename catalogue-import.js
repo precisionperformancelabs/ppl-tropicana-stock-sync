@@ -136,7 +136,24 @@ async function loadFeed() {
 
   const sample =
     [...unique.entries()].slice(0, 20);
+  console.log('SCHEMA_DISCOVERY_START');
 
+  for (const [sku, row] of sample.slice(0, 5)) {
+    console.log(
+      'ROW_SCHEMA ' +
+      JSON.stringify({
+        ProductCode: sku,
+        Keys: Object.keys(row)
+      })
+    );
+
+    console.log(
+      'ROW_DATA ' +
+      JSON.stringify(row)
+    );
+  }
+
+  console.log('SCHEMA_DISCOVERY_END');
     for (const [sku, row] of sample) {
     console.log(
       'FEED_SAMPLE ' +
