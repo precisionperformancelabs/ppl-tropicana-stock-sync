@@ -137,4 +137,45 @@ async function loadFeed() {
   const sample =
     [...unique.entries()].slice(0, 20);
 
-  for (const [sku, row] of
+    for (const [sku, row] of sample) {
+    console.log(
+      'FEED_SAMPLE ' +
+      JSON.stringify({
+        ProductCode: sku,
+        Description:
+          clean(row.Description) ||
+          clean(row.ProductName) ||
+          clean(row.Name),
+        Barcode:
+          clean(row.Barcode) ||
+          clean(row.EAN) ||
+          clean(row.EAN13),
+        Price:
+          clean(row.Price) ||
+          clean(row.CostPrice) ||
+          clean(row.TradePrice),
+        Stock:
+          clean(row.StockLevel) ||
+          clean(row.StockQuantity) ||
+          clean(row.StockQty) ||
+          clean(row.FreeStock)
+      })
+    );
+  }
+
+  console.log(
+    'CATALOGUE_AUDIT_COMPLETE'
+  );
+
+  console.log(
+    'NO_SHOPIFY_CHANGES_MADE'
+  );
+
+})().catch(error => {
+  console.error(
+    'CATALOGUE_AUDIT_FAILED',
+    error.stack || error
+  );
+
+  process.exit(1);
+});
