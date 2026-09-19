@@ -59,9 +59,15 @@ function row(r) {
 }
 
 function identity(r) {
-  const x = { ...r };
-  delete x.StockLevel;
-  return JSON.stringify(x);
+  return JSON.stringify({
+    ProductCode: clean(r.ProductCode),
+    TranslationName: clean(r.TranslationName),
+    Barcode: clean(r.Barcode),
+    Brand: clean(r.Brand),
+    Flavour: clean(r.Flavour),
+    Size: clean(r.Size),
+    ProductPrice: clean(r.ProductPrice)
+  });
 }
 
 function pricing(net) {
