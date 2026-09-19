@@ -93,7 +93,18 @@ function ordinaryExcluded(r) {
   const n = norm(r.TranslationName);
   const c = norm(r.FilterByCategory);
   const t = `${b} ${n} ${c}`;
+// Exclude single-serving products.
+// Multipacks such as 12x55g are NOT blocked by this rule.
+const singleServing =
+  /\b(single[\s-]?serv(e|ing)?|single[\s-]?portion|sample|sample[\s-]?pack|sachet)\b/i.test(t);
 
+const multipack =
+  /\b\d+\s*[xX×]\s*\d+(?:\.\d+)?\s*(?:g|kg|ml|l)\b/i.test(t) ||
+  /\b\d+\s*(?:pack|pk|sachets|servings)\b/i.test(t);
+
+if (singleServing && !multipack) return true;
+
+  
   const blocked = [
     "irn bru",
     "kellogg",
