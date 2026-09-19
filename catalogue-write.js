@@ -18,7 +18,7 @@
 const SFTP = require("ssh2-sftp-client");
 const { XMLParser } = require("fast-xml-parser");
 
-const TEST_SKU_LIMIT = 500;
+const TEST_SKU_LIMIT = 100;
 const SHOPIFY_API_VERSION = "2026-07";
 
 function clean(v) {
