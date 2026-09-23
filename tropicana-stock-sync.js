@@ -523,7 +523,7 @@ async function activateAtDropship(
 
     if (
       !sku ||
-      !feed.has(sku) ||
+      !feed.has(sku)
     ) {
       continue;
     }
