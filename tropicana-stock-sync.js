@@ -524,7 +524,6 @@ async function activateAtDropship(
     if (
       !sku ||
       !feed.has(sku) ||
-      !isTropicanaVariant(v)
     ) {
       continue;
     }
