@@ -1,24 +1,31 @@
 "use strict";
 
 /*
-  PPL Tropicana controlled catalogue writer V2
-  FIRST V2 TEST:
-  - maximum 20 NEW SKUs
-  - genuine flavour variants grouped into one product where safe
-  - DRAFT only
-  - ZERO inventory writes
-  - ZERO order calls
-  - exact SKU protection immediately before writes
-  - global barcode collision protection
-  - hard nicotine/vape/alcohol block
-  - PPL / Hiro / KMT protected
-  - fail closed on uncertainty
+PPL CONTROLLED CATALOGUE WRITER V2
+
+FULL ELIGIBLE CATALOGUE RECONCILIATION
+
+- Genuine flavour variants grouped where safe
+- New products created as DRAFT only
+- Missing variants may be added to an existing parent
+- ZERO inventory writes
+- ZERO order calls
+- ZERO publishing calls
+- Exact SKU protection immediately before writes
+- Global barcode collision protection
+- Hard nicotine / vape / alcohol block
+- PPL / Hiro / KMT protected
+- Barebells / Natures Aid excluded
+- Water / protein water excluded
+- Olimp capsules excluded
+- Clothing excluded
+- Known incompatible Shopify option structures are skipped safely
+- Unexpected/uncertain write errors remain fail-closed
 */
 
 const SFTP = require("ssh2-sftp-client");
 const { XMLParser } = require("fast-xml-parser");
 
-const TEST_SKU_LIMIT = 500;
 const SHOPIFY_API_VERSION = "2026-07";
 
 function clean(v) {
@@ -26,7 +33,9 @@ function clean(v) {
 }
 
 function norm(v) {
-  return clean(v).toLowerCase().replace(/\s+/g, " ");
+  return clean(v)
+    .toLowerCase()
+    .replace(/\s+/g, " ");
 }
 
 function num(v) {
@@ -58,7 +67,9 @@ function hardBlocked(r) {
   const c = norm(r.FilterByCategory);
   const t = `${b} ${n} ${c}`;
 
-  // Never create protected/non-Tropicana ranges.
+  /*
+  Never create protected ranges.
+  */
   if (
     b === "ppl" ||
     b.includes("precision performance labs") ||
@@ -68,7 +79,9 @@ function hardBlocked(r) {
     return "protected-brand";
   }
 
-  // Brands intentionally excluded from PPL catalogue.
+  /*
+  Brands intentionally excluded.
+  */
   if (
     b === "barebells" ||
     b === "natures aid"
@@ -76,20 +89,24 @@ function hardBlocked(r) {
     return "excluded-brand";
   }
 
-  // Non-negotiable nicotine/vape block.
+  /*
+  Non-negotiable nicotine/vape block.
+  */
   if (
-    t.includes("nicotine") ||
-    t.includes("vape") ||
-    t.includes("vaping") ||
-    t.includes("e-cig") ||
-    t.includes("e cigarette") ||
-    t.includes("e-cigarette")
+    /\bnicotine\b/.test(t) ||
+    /\bvapes?\b/.test(t) ||
+    /\bvaping\b/.test(t) ||
+    /\be[\s-]?cig(?:arette)?s?\b/.test(t)
   ) {
     return "nicotine-vape";
   }
 
-  // Non-negotiable alcohol block.
-  if (/\b(alcohol|beer|wine|cider)\b/.test(t)) {
+  /*
+  Non-negotiable alcohol block.
+  */
+  if (
+    /\b(alcohol|beer|wine|cider)\b/.test(t)
+  ) {
     return "alcohol";
   }
 
@@ -101,18 +118,29 @@ function ordinaryExcluded(r) {
   const n = norm(r.TranslationName);
   const c = norm(r.FilterByCategory);
   const t = `${b} ${n} ${c}`;
-// Exclude single-serving products.
-// Multipacks such as 12x55g are NOT blocked by this rule.
-const singleServing =
-  /\b(single[\s-]?serv(e|ing)?|single[\s-]?portion|sample|sample[\s-]?pack|sachet)\b/i.test(t);
 
-const multipack =
-  /\b\d+\s*[xX×]\s*\d+(?:\.\d+)?\s*(?:g|kg|ml|l)\b/i.test(t) ||
-  /\b\d+\s*(?:pack|pk|sachets|servings)\b/i.test(t);
+  /*
+  Exclude single-serving products.
+  Multipacks such as 12x55g are not
+  blocked by this rule.
+  */
+  const singleServing =
+    /\b(single[\s-]?serv(e|ing)?|single[\s-]?portion|sample|sample[\s-]?pack|sachet)\b/i.test(
+      t
+    );
 
-if (singleServing && !multipack) return true;
+  const multipack =
+    /\b\d+\s*[xX×]\s*\d+(?:\.\d+)?\s*(?:g|kg|ml|l)\b/i.test(
+      t
+    ) ||
+    /\b\d+\s*(?:pack|pk|sachets|servings)\b/i.test(
+      t
+    );
 
-  
+  if (singleServing && !multipack) {
+    return "single-serving";
+  }
+
   const blocked = [
     "irn bru",
     "kellogg",
@@ -136,10 +164,49 @@ if (singleServing && !multipack) return true;
   ];
 
   for (const x of blocked) {
-    if (t.includes(x)) return x;
+    if (t.includes(x)) {
+      return x;
+    }
   }
 
-  if (/\b(sauce|sauces|syrup|syrups)\b/.test(t)) {
+  /*
+  Water and protein-water products.
+
+  Word boundaries deliberately prevent
+  flavours such as "Watermelon" from
+  being accidentally excluded.
+  */
+  if (/\bwater\b/.test(t)) {
+    return "water";
+  }
+
+  /*
+  Olimp Sport is allowed, but capsules
+  are specifically excluded.
+  */
+  if (
+    /\bolimp(?:\s+sport(?:\s+nutrition)?)?\b/.test(b) &&
+    /\bcaps?(?:ule)?s?\b/.test(t)
+  ) {
+    return "olimp-capsules";
+  }
+
+  /*
+  Clothing is excluded.
+  Accessories such as shakers are not
+  blocked by this rule.
+  */
+  if (
+    /\b(t[\s-]?shirt|tee|hoodie|sweatshirt|joggers|leggings|shorts|vest|sports[\s-]?bra|tracksuit|clothing|apparel)\b/.test(
+      t
+    )
+  ) {
+    return "clothing";
+  }
+
+  if (
+    /\b(sauce|sauces|syrup|syrups)\b/.test(t)
+  ) {
     return "sauce/syrup";
   }
 
@@ -152,7 +219,7 @@ if (singleServing && !multipack) return true;
   }
 
   if (t.includes("cereal bar")) {
-    return "cereal bar";
+    return "cereal-bar";
   }
 
   if (
@@ -161,7 +228,7 @@ if (singleServing && !multipack) return true;
     t.includes("1 sachet") ||
     t.includes("1x sachet")
   ) {
-    return "single serving";
+    return "single-serving";
   }
 
   return "";
@@ -171,12 +238,20 @@ function extractRows(parsed) {
   const rows = [];
 
   function walk(x) {
-    if (!x || typeof x !== "object") return;
+    if (!x || typeof x !== "object") {
+      return;
+    }
 
     if (
       !Array.isArray(x) &&
-      Object.prototype.hasOwnProperty.call(x, "ProductCode") &&
-      Object.prototype.hasOwnProperty.call(x, "TranslationName")
+      Object.prototype.hasOwnProperty.call(
+        x,
+        "ProductCode"
+      ) &&
+      Object.prototype.hasOwnProperty.call(
+        x,
+        "TranslationName"
+      )
     ) {
       rows.push(x);
     }
@@ -186,7 +261,10 @@ function extractRows(parsed) {
         for (const item of v) {
           walk(item);
         }
-      } else if (v && typeof v === "object") {
+      } else if (
+        v &&
+        typeof v === "object"
+      ) {
         walk(v);
       }
     }
@@ -200,7 +278,9 @@ function extractRows(parsed) {
 function identity(r) {
   return JSON.stringify({
     ProductCode: clean(r.ProductCode),
-    TranslationName: clean(r.TranslationName),
+    TranslationName: clean(
+      r.TranslationName
+    ),
     Barcode: clean(r.Barcode),
     Brand: clean(r.Brand),
     Flavour: clean(r.Flavour),
@@ -210,30 +290,34 @@ function identity(r) {
 }
 
 /*
-  Conservative family grouping.
+Conservative family grouping.
 
-  We only group rows where:
-  - a real Flavour exists
-  - the flavour occurs at the END of TranslationName
-  - brand matches
-  - base title matches
-  - exact size matches
-  - supplier category matches
+We only group rows where:
+- a real Flavour exists
+- the flavour occurs at the END of TranslationName
+- brand matches
+- base title matches
+- exact size matches
+- supplier category matches
 
-  Anything ambiguous stays as its own product.
+Anything ambiguous stays as its own product.
 */
 function familyInfo(r) {
   const title = clean(r.TranslationName);
   const flavour = clean(r.Flavour);
   const size = clean(r.Size);
   const brand = clean(r.Brand);
-  const category = clean(r.FilterByCategory);
+  const category = clean(
+    r.FilterByCategory
+  );
 
   if (!flavour) {
     return {
       key: `single:${clean(r.ProductCode)}`,
       title,
-      optionName: size ? "Size" : "Title",
+      optionName: size
+        ? "Size"
+        : "Title",
       optionValue: size || "Default",
       groupable: false
     };
@@ -269,7 +353,6 @@ function familyInfo(r) {
       `${norm(baseTitle)}|` +
       `${norm(size)}|` +
       `${norm(category)}`,
-
     title: baseTitle,
     optionName: "Flavour",
     optionValue: flavour,
@@ -285,7 +368,9 @@ async function loadFeed() {
 
   for (const k of required) {
     if (!process.env[k]) {
-      throw new Error(`Missing ${k}`);
+      throw new Error(
+        `Missing ${k}`
+      );
     }
   }
 
@@ -298,7 +383,8 @@ async function loadFeed() {
         "tropicana.ftp.redtechnology.com",
 
       port: Number(
-        process.env.TROPICANA_SFTP_PORT || 22
+        process.env.TROPICANA_SFTP_PORT ||
+          22
       ),
 
       username:
@@ -308,13 +394,16 @@ async function loadFeed() {
         process.env.TROPICANA_SFTP_PASSWORD
     });
 
-    console.log("TROPICANA_LOGIN_OK");
+    console.log(
+      "TROPICANA_LOGIN_OK"
+    );
 
     const file =
       process.env.TROPICANA_SFTP_FILE ||
       "DropshipProductFeed.xml";
 
-    const xml = await sftp.get(file);
+    const xml =
+      await sftp.get(file);
 
     console.log(
       `FEED_DOWNLOAD_OK bytes=${xml.length}`
@@ -323,17 +412,21 @@ async function loadFeed() {
     const parsed = new XMLParser({
       ignoreAttributes: false,
       trimValues: true
-    }).parse(xml.toString("utf8"));
+    }).parse(
+      xml.toString("utf8")
+    );
 
-    console.log("FEED_XML_PARSE_OK");
+    console.log(
+      "FEED_XML_PARSE_OK"
+    );
 
     return extractRows(parsed);
-
   } finally {
-
     try {
       await sftp.end();
-    } catch (_) {}
+    } catch (_) {
+      // Ignore disconnect errors.
+    }
   }
 }
 
@@ -373,7 +466,8 @@ async function shopifyAuth() {
       body: JSON.stringify({
         client_id: clientId,
         client_secret: clientSecret,
-        grant_type: "client_credentials"
+        grant_type:
+          "client_credentials"
       })
     }
   );
@@ -405,8 +499,8 @@ async function gql(
 ) {
   const res = await fetch(
     `https://${auth.domain}` +
-    `/admin/api/${SHOPIFY_API_VERSION}` +
-    `/graphql.json`,
+      `/admin/api/${SHOPIFY_API_VERSION}` +
+      `/graphql.json`,
     {
       method: "POST",
 
@@ -436,7 +530,9 @@ async function gql(
   if (json.errors?.length) {
     throw new Error(
       `Shopify GraphQL: ` +
-      `${JSON.stringify(json.errors)}`
+        `${JSON.stringify(
+          json.errors
+        )}`
     );
   }
 
@@ -463,7 +559,6 @@ async function exactSkuMatches(
           id
           sku
           barcode
-
           product {
             id
             title
@@ -511,7 +606,6 @@ async function exactBarcodeMatches(
           id
           sku
           barcode
-
           product {
             id
             title
@@ -527,7 +621,9 @@ async function exactBarcodeMatches(
     query,
     {
       query:
-        `barcode:"${searchEscape(barcode)}"`
+        `barcode:"${searchEscape(
+          barcode
+        )}"`
     }
   );
 
@@ -548,33 +644,41 @@ async function preflightFamily(
   const missing = [];
 
   for (const item of family.items) {
-    const sku = clean(item.row.ProductCode);
-    const barcode = clean(item.row.Barcode);
+    const sku =
+      clean(item.row.ProductCode);
+
+    const barcode =
+      clean(item.row.Barcode);
 
     const skuMatches =
-      await exactSkuMatches(auth, sku);
+      await exactSkuMatches(
+        auth,
+        sku
+      );
 
     if (skuMatches.length > 1) {
       return {
         ok: false,
-        reason: `duplicate-shopify-sku:${sku}`,
+        reason:
+          `duplicate-shopify-sku:${sku}`,
         existing,
         missing
       };
     }
 
     if (skuMatches.length === 1) {
-      const match = skuMatches[0];
+      const match =
+        skuMatches[0];
 
       /*
-      If the SKU already exists, make sure
-      the supplier barcode does not disagree
-      with the Shopify barcode.
+      Existing SKU must not disagree
+      with the supplier barcode.
       */
       if (
         barcode &&
         clean(match.barcode) &&
-        clean(match.barcode) !== barcode
+        clean(match.barcode) !==
+          barcode
       ) {
         return {
           ok: false,
@@ -596,8 +700,8 @@ async function preflightFamily(
 
     /*
     SKU is genuinely missing.
-    Make sure its barcode is not already
-    attached to another Shopify variant.
+    Its barcode must not already belong
+    to another Shopify variant.
     */
     if (barcode) {
       const barcodeMatches =
@@ -606,14 +710,19 @@ async function preflightFamily(
           barcode
         );
 
-      if (barcodeMatches.length > 0) {
+      if (
+        barcodeMatches.length > 0
+      ) {
         return {
           ok: false,
           reason:
             `barcode-collision:` +
             `${barcode}:` +
             barcodeMatches
-              .map(x => clean(x.sku))
+              .map(
+                x =>
+                  clean(x.sku)
+              )
               .join(","),
           existing,
           missing
@@ -624,11 +733,9 @@ async function preflightFamily(
     missing.push(item);
   }
 
-  /*
-  Work out what kind of family this is.
-  */
   if (
-    existing.length === family.items.length
+    existing.length ===
+    family.items.length
   ) {
     return {
       ok: true,
@@ -647,11 +754,6 @@ async function preflightFamily(
     };
   }
 
-  /*
-  A mixture is no longer treated as an
-  error. The write stage will deal with
-  only the genuinely missing variants.
-  */
   return {
     ok: true,
     mode: "PARTIAL_EXISTING",
@@ -659,16 +761,26 @@ async function preflightFamily(
     missing
   };
 }
-function resolveExistingParent(preflight) {
+
+function resolveExistingParent(
+  preflight
+) {
   const productIds = [
     ...new Set(
       preflight.existing
-        .map(x => clean(x.match?.product?.id))
+        .map(
+          x =>
+            clean(
+              x.match?.product?.id
+            )
+        )
         .filter(Boolean)
     )
   ];
 
-  if (preflight.mode === "ALL_NEW") {
+  if (
+    preflight.mode === "ALL_NEW"
+  ) {
     return {
       ok: true,
       productId: null
@@ -689,6 +801,7 @@ function resolveExistingParent(preflight) {
     productId: productIds[0]
   };
 }
+
 async function createDraftFamily(
   auth,
   family
@@ -700,8 +813,8 @@ async function createDraftFamily(
   }
 
   /*
-    Re-check every SKU/barcode
-    immediately before writing.
+  Re-check every SKU/barcode
+  immediately before writing.
   */
   const finalCheck =
     await preflightFamily(
@@ -712,34 +825,269 @@ async function createDraftFamily(
   if (!finalCheck.ok) {
     throw new Error(
       `PREFLIGHT_FAILED ` +
-      `${finalCheck.reason}`
+        `${finalCheck.reason}`
     );
   }
-const parentCheck =
-  resolveExistingParent(finalCheck);
 
-if (!parentCheck.ok) {
-  throw new Error(
-    `PARENT_CHECK_FAILED ` +
-    `${parentCheck.reason}`
-  );
-}
+  const parentCheck =
+    resolveExistingParent(
+      finalCheck
+    );
 
-if (finalCheck.mode === "ALL_EXISTING") {
-  return {
-    action: "SKIPPED_ALL_EXISTING",
-    createdSkus: [],
-    productId: parentCheck.productId
-  };
-}
+  if (!parentCheck.ok) {
+    throw new Error(
+      `PARENT_CHECK_FAILED ` +
+        `${parentCheck.reason}`
+    );
+  }
+
+  if (
+    finalCheck.mode ===
+    "ALL_EXISTING"
+  ) {
+    return {
+      action:
+        "SKIPPED_ALL_EXISTING",
+      createdSkus: [],
+      productId:
+        parentCheck.productId
+    };
+  }
+
   const brand =
     clean(
       family.items[0].row.Brand
-    ) || "Tropicana";
+    ) || "Unknown";
 
   const optionName =
     family.optionName;
 
+  /*
+  PARTIAL EXISTING FAMILY
+
+  Only create genuinely missing
+  variants on the already-established
+  Shopify parent.
+  */
+  if (
+    finalCheck.mode ===
+    "PARTIAL_EXISTING"
+  ) {
+    const missingItems =
+      finalCheck.missing;
+
+    if (!parentCheck.productId) {
+      throw new Error(
+        "PARTIAL_EXISTING_WITHOUT_PARENT"
+      );
+    }
+
+    if (!missingItems.length) {
+      throw new Error(
+        "PARTIAL_EXISTING_WITHOUT_MISSING_ITEMS"
+      );
+    }
+
+    const missingVariants = [];
+
+    for (
+      const item of missingItems
+    ) {
+      const r = item.row;
+
+      const sku =
+        clean(r.ProductCode);
+
+      const barcode =
+        clean(r.Barcode);
+
+      const net =
+        num(r.ProductPrice);
+
+      const value =
+        clean(item.optionValue);
+
+      if (
+        !sku ||
+        !(net > 0) ||
+        !value
+      ) {
+        throw new Error(
+          `UNSAFE_MISSING_VARIANT ${sku}`
+        );
+      }
+
+      missingVariants.push({
+        optionValues: [
+          {
+            optionName,
+            name: value
+          }
+        ],
+
+        inventoryItem: {
+          sku
+        },
+
+        barcode:
+          barcode || null,
+
+        price:
+          String(
+            pricing(net).retail
+          ),
+
+        taxable: false
+      });
+    }
+
+    const partialMutation = `
+      mutation AddMissingVariants(
+        $productId: ID!,
+        $variants: [ProductVariantsBulkInput!]!
+      ) {
+        productVariantsBulkCreate(
+          productId: $productId,
+          variants: $variants,
+          strategy: REMOVE_STANDALONE_VARIANT
+        ) {
+          productVariants {
+            id
+            sku
+            barcode
+            price
+          }
+          userErrors {
+            field
+            message
+          }
+        }
+      }
+    `;
+
+    const partialResult =
+      await gql(
+        auth,
+        partialMutation,
+        {
+          productId:
+            parentCheck.productId,
+
+          variants:
+            missingVariants
+        }
+      );
+
+    const payload =
+      partialResult
+        ?.productVariantsBulkCreate;
+
+    const errors =
+      payload?.userErrors || [];
+
+    if (errors.length) {
+      throw new Error(
+        `PARTIAL_VARIANT_WRITE_FAILED ` +
+          JSON.stringify(errors)
+      );
+    }
+
+    const created =
+      payload?.productVariants || [];
+
+    if (
+      created.length !==
+      missingVariants.length
+    ) {
+      throw new Error(
+        `PARTIAL_VARIANT_COUNT_MISMATCH ` +
+          `expected=${missingVariants.length} ` +
+          `created=${created.length}`
+      );
+    }
+
+    /*
+    Verify each newly created SKU.
+    */
+    for (
+      const item of missingItems
+    ) {
+      const sku =
+        clean(
+          item.row.ProductCode
+        );
+
+      const matches =
+        await exactSkuMatches(
+          auth,
+          sku
+        );
+
+      if (matches.length !== 1) {
+        throw new Error(
+          `PARTIAL_VERIFY_SKU_COUNT ` +
+            `${sku}:${matches.length}`
+        );
+      }
+
+      const actualProductId =
+        clean(
+          matches[0]
+            ?.product
+            ?.id
+        );
+
+      if (
+        actualProductId !==
+        parentCheck.productId
+      ) {
+        throw new Error(
+          `PARTIAL_VERIFY_WRONG_PARENT ` +
+            `${sku}`
+        );
+      }
+
+      const supplierBarcode =
+        clean(
+          item.row.Barcode
+        );
+
+      if (
+        supplierBarcode &&
+        clean(
+          matches[0].barcode
+        ) !== supplierBarcode
+      ) {
+        throw new Error(
+          `PARTIAL_VERIFY_BARCODE_FAILED ` +
+            `${sku}`
+        );
+      }
+    }
+
+    return {
+      action:
+        "ADDED_MISSING_VARIANTS",
+
+      productId:
+        parentCheck.productId,
+
+      createdSkus:
+        missingItems.map(
+          item =>
+            clean(
+              item.row.ProductCode
+            )
+        )
+    };
+  }
+
+  /*
+  ALL-NEW FAMILY
+
+  Build the complete family and create
+  one DRAFT Shopify product.
+  */
   const seenOptions =
     new Set();
 
@@ -777,11 +1125,6 @@ if (finalCheck.mode === "ALL_EXISTING") {
     const normalizedValue =
       norm(value);
 
-    /*
-      Shopify cannot safely create
-      two variants with identical
-      option values in this model.
-    */
     if (
       seenOptions.has(
         normalizedValue
@@ -789,8 +1132,8 @@ if (finalCheck.mode === "ALL_EXISTING") {
     ) {
       throw new Error(
         `DUPLICATE_OPTION_VALUE ` +
-        `family=${family.title} ` +
-        `value=${value}`
+          `family=${family.title} ` +
+          `value=${value}`
       );
     }
 
@@ -823,185 +1166,7 @@ if (finalCheck.mode === "ALL_EXISTING") {
       taxable: false
     });
   }
-if (finalCheck.mode === "PARTIAL_EXISTING") {
-  const missingItems = finalCheck.missing;
 
-  if (!parentCheck.productId) {
-    throw new Error(
-      "PARTIAL_EXISTING_WITHOUT_PARENT"
-    );
-  }
-
-  if (!missingItems.length) {
-    throw new Error(
-      "PARTIAL_EXISTING_WITHOUT_MISSING_ITEMS"
-    );
-  }
-
-  const missingVariants = [];
-
-  for (const item of missingItems) {
-    const r = item.row;
-
-    const sku =
-      clean(r.ProductCode);
-
-    const barcode =
-      clean(r.Barcode);
-
-    const net =
-      num(r.ProductPrice);
-
-    const value =
-      clean(item.optionValue);
-
-    if (
-      !sku ||
-      !(net > 0) ||
-      !value
-    ) {
-      throw new Error(
-        `UNSAFE_MISSING_VARIANT ${sku}`
-      );
-    }
-
-     missingVariants.push({
-  optionValues: [
-    {
-      optionName,
-      name: value
-    }
-  ],
-
-inventoryItem: {
-  sku
-},
-barcode: barcode || null,
-price: String(pricing(net).retail),
-taxable: false
-
-});
-
-  }
-
-  const partialMutation = `
-    mutation AddMissingVariants(
-      $productId: ID!,
-      $variants: [ProductVariantsBulkInput!]!
-    ) {
-      productVariantsBulkCreate(
-        productId: $productId,
-        variants: $variants,
-        strategy: REMOVE_STANDALONE_VARIANT
-      ) {
-        productVariants {
-          id
-          sku
-          barcode
-          price
-        }
-        userErrors {
-          field
-          message
-        }
-      }
-    }
-  `;
-
-  const partialResult =
-    await gql(
-      auth,
-      partialMutation,
-      {
-        productId:
-          parentCheck.productId,
-        variants:
-          missingVariants
-      }
-    );
-
-  const payload =
-    partialResult
-      ?.productVariantsBulkCreate;
-
-  const errors =
-    payload?.userErrors || [];
-
-  if (errors.length) {
-    throw new Error(
-      `PARTIAL_VARIANT_WRITE_FAILED ` +
-      JSON.stringify(errors)
-    );
-  }
-
-  const created =
-    payload?.productVariants || [];
-
-  if (
-    created.length !==
-    missingVariants.length
-  ) {
-    throw new Error(
-      `PARTIAL_VARIANT_COUNT_MISMATCH ` +
-      `expected=${missingVariants.length} ` +
-      `created=${created.length}`
-    );
-  }
-
-  /*
-  Re-check every missing SKU after writing.
-  Each must now exist exactly once and belong
-  to the parent product we deliberately chose.
-  */
-  for (const item of missingItems) {
-    const sku =
-      clean(item.row.ProductCode);
-
-    const matches =
-      await exactSkuMatches(
-        auth,
-        sku
-      );
-
-    if (matches.length !== 1) {
-      throw new Error(
-        `PARTIAL_VERIFY_SKU_COUNT ` +
-        `${sku}:${matches.length}`
-      );
-    }
-
-    const actualProductId =
-      clean(
-        matches[0]
-          ?.product
-          ?.id
-      );
-
-    if (
-      actualProductId !==
-      parentCheck.productId
-    ) {
-      throw new Error(
-        `PARTIAL_VERIFY_WRONG_PARENT ` +
-        `${sku}`
-      );
-    }
-  }
-
-  return {
-    action:
-      "ADDED_MISSING_VARIANTS",
-    productId:
-      parentCheck.productId,
-    createdSkus:
-      missingItems.map(
-        item =>
-          clean(
-            item.row.ProductCode
-          )
-      )
-  };
-}
   const mutation = `
     mutation CreateControlledFamily(
       $input: ProductSetInput!
@@ -1015,7 +1180,6 @@ taxable: false
           title
           status
           vendor
-
           variants(first: 100) {
             nodes {
               id
@@ -1025,7 +1189,6 @@ taxable: false
             }
           }
         }
-
         userErrors {
           field
           message
@@ -1044,6 +1207,11 @@ taxable: false
     status:
       "DRAFT",
 
+    /*
+    Internal PPL tags only.
+    No supplier name is written to
+    customer-facing product data.
+    */
     tags: [
       "PPL controlled import",
       "PPL V2 family import"
@@ -1077,9 +1245,9 @@ taxable: false
   ) {
     throw new Error(
       `CREATE_USER_ERRORS ` +
-      `${JSON.stringify(
-        result.userErrors
-      )}`
+        `${JSON.stringify(
+          result.userErrors
+        )}`
     );
   }
 
@@ -1099,18 +1267,21 @@ taxable: false
     product.variants?.nodes || [];
 
   /*
-    Verify every created variant
-    against the supplier SKU and
-    barcode.
+  Verify every created variant
+  against supplier SKU/barcode.
   */
   for (
     const item of family.items
   ) {
     const sku =
-      clean(item.row.ProductCode);
+      clean(
+        item.row.ProductCode
+      );
 
     const barcode =
-      clean(item.row.Barcode);
+      clean(
+        item.row.Barcode
+      );
 
     const matches =
       createdVariants.filter(
@@ -1118,28 +1289,36 @@ taxable: false
           clean(v.sku) === sku
       );
 
+    if (matches.length !== 1) {
+      throw new Error(
+        `POST_CREATE_VARIANT_VERIFY_FAILED ` +
+          `${sku}`
+      );
+    }
+
     if (
-      matches.length !== 1 ||
       clean(
         matches[0].barcode
       ) !== barcode
     ) {
       throw new Error(
-        `POST_CREATE_VARIANT_VERIFY_FAILED ` +
-        `${sku}`
+        `POST_CREATE_BARCODE_VERIFY_FAILED ` +
+          `${sku}`
       );
     }
   }
 
   /*
-    Independent Shopify search
-    verification after creation.
+  Independent exact Shopify search
+  verification after creation.
   */
   for (
     const item of family.items
   ) {
     const sku =
-      clean(item.row.ProductCode);
+      clean(
+        item.row.ProductCode
+      );
 
     const after =
       await exactSkuMatches(
@@ -1156,61 +1335,66 @@ taxable: false
     ) {
       throw new Error(
         `FINAL_EXACT_SKU_VERIFY_FAILED ` +
-        `${sku}`
+          `${sku}`
       );
     }
   }
 
   console.log(
     `FAMILY_CREATED_VERIFIED ` +
-    `${JSON.stringify({
-      productId:
-        product.id,
+      `${JSON.stringify({
+        productId:
+          product.id,
 
-      title:
-        product.title,
+        title:
+          product.title,
 
-      status:
-        product.status,
+        status:
+          product.status,
 
-      variantCount:
-        family.items.length,
+        variantCount:
+          family.items.length,
 
-      skus:
-        family.items.map(
-          x =>
-            clean(
-              x.row.ProductCode
-            )
-        )
-    })}`
+        skus:
+          family.items.map(
+            x =>
+              clean(
+                x.row.ProductCode
+              )
+          )
+      })}`
   );
 
-return {
-  action: "CREATED_NEW_FAMILY",
-  productId: product.id,
-  createdSkus: family.items.map(
-    item =>
-      clean(
-        item.row.ProductCode
+  return {
+    action:
+      "CREATED_NEW_FAMILY",
+
+    productId:
+      product.id,
+
+    createdSkus:
+      family.items.map(
+        item =>
+          clean(
+            item.row.ProductCode
+          )
       )
-  )
-};
+  };
 }
 
 async function main() {
   console.log(
     "BUILD_MARKER " +
-    "PPL-CATALOGUE-WRITER-V2-20SKU"
+      "PPL-CATALOGUE-WRITER-V2-FULL"
   );
 
   console.log(
     "MODE=" +
-    "CONTROLLED_FAMILY_WRITE_DRAFT_ONLY"
+      "FULL_ELIGIBLE_CATALOGUE_RECONCILIATION_DRAFT_ONLY"
   );
 
   console.log(
-    `TEST_SKU_LIMIT=${TEST_SKU_LIMIT}`
+    "SKU_LIMIT=NONE"
   );
 
   console.log(
@@ -1233,8 +1417,8 @@ async function main() {
   );
 
   /*
-    Group duplicate XML rows
-    by exact ProductCode.
+  Group duplicate XML rows by
+  exact ProductCode.
   */
   const bySku =
     new Map();
@@ -1243,7 +1427,9 @@ async function main() {
     const sku =
       clean(r.ProductCode);
 
-    if (!sku) continue;
+    if (!sku) {
+      continue;
+    }
 
     if (!bySku.has(sku)) {
       bySku.set(
@@ -1258,9 +1444,9 @@ async function main() {
   }
 
   /*
-    Only retain ProductCodes whose
-    sellable identity is consistent
-    across duplicate XML rows.
+  Only retain ProductCodes whose
+  sellable identity is consistent
+  across duplicate XML rows.
   */
   const safe =
     new Map();
@@ -1289,20 +1475,23 @@ async function main() {
 
   console.log(
     `UNIQUE_PRODUCT_CODES=` +
-    `${bySku.size}`
+      `${bySku.size}`
   );
 
   console.log(
     `CONFLICTING_DUPLICATES_SKIPPED=` +
-    `${conflicts}`
+      `${conflicts}`
   );
 
   /*
-    Apply hard safety blocks,
-    ordinary exclusions and
-    price validation.
+  Apply safety blocks,
+  exclusions and price validation.
   */
   const candidates = [];
+
+  let hardBlockedCount = 0;
+  let ordinaryExcludedCount = 0;
+  let invalidPriceCount = 0;
 
   for (
     const [sku, r]
@@ -1312,17 +1501,27 @@ async function main() {
       hardBlocked(r);
 
     if (hard) {
+      hardBlockedCount++;
+
       console.log(
         `HARD_BLOCK ` +
-        `${sku} ${hard}`
+          `${sku} ${hard}`
       );
 
       continue;
     }
 
-    if (
-      ordinaryExcluded(r)
-    ) {
+    const excluded =
+      ordinaryExcluded(r);
+
+    if (excluded) {
+      ordinaryExcludedCount++;
+
+      console.log(
+        `EXCLUDED ` +
+          `${sku} ${excluded}`
+      );
+
       continue;
     }
 
@@ -1333,6 +1532,7 @@ async function main() {
       net === null ||
       net <= 0
     ) {
+      invalidPriceCount++;
       continue;
     }
 
@@ -1340,20 +1540,29 @@ async function main() {
   }
 
   console.log(
+    `HARD_BLOCKED=${hardBlockedCount}`
+  );
+
+  console.log(
+    `ORDINARY_EXCLUDED=${ordinaryExcludedCount}`
+  );
+
+  console.log(
+    `INVALID_PRICE_SKIPPED=${invalidPriceCount}`
+  );
+
+  console.log(
     `SAFE_FEED_CANDIDATES=` +
-    `${candidates.length}`
+      `${candidates.length}`
   );
 
   /*
-    Build conservative product
-    families.
+  Build conservative product families.
   */
   const familyMap =
     new Map();
 
-  for (
-    const r of candidates
-  ) {
+  for (const r of candidates) {
     const info =
       familyInfo(r);
 
@@ -1396,17 +1605,17 @@ async function main() {
 
   console.log(
     `SAFE_FAMILIES=` +
-    `${families.length}`
+      `${families.length}`
   );
 
   console.log(
     `MULTI_VARIANT_FAMILIES=` +
-    `${
-      families.filter(
-        f =>
-          f.items.length > 1
-      ).length
-    }`
+      `${
+        families.filter(
+          f =>
+            f.items.length > 1
+        ).length
+      }`
   );
 
   const auth =
@@ -1415,9 +1624,11 @@ async function main() {
   let createdSkus = 0;
   let createdProducts = 0;
 
-  let skippedExistingFamily = 0;
+  let completedExistingFamilies = 0;
+
   let skippedCollisionFamily = 0;
-  let skippedLimit = 0;
+
+  let skippedOptionMismatch = 0;
 
   let failed = 0;
 
@@ -1425,27 +1636,13 @@ async function main() {
     const family
     of families
   ) {
-    if (
-      createdSkus >=
-      TEST_SKU_LIMIT
-    ) {
-      break;
-    }
-
-    /*
-      Never create only part of
-      a family.
-    */
-    if (
-      createdSkus +
-      family.items.length >
-      TEST_SKU_LIMIT
-    ) {
-      skippedLimit++;
-      continue;
-    }
-
     try {
+      /*
+      First read-only preflight.
+      createDraftFamily performs
+      another preflight immediately
+      before any write.
+      */
       const check =
         await preflightFamily(
           auth,
@@ -1453,86 +1650,115 @@ async function main() {
         );
 
       if (!check.ok) {
-        if (
-          check.reason.startsWith(
-            "existing-sku:"
-          )
-        ) {
-          skippedExistingFamily++;
-        } else {
-          skippedCollisionFamily++;
+        skippedCollisionFamily++;
 
-          console.log(
-            `SKIP_FAMILY ` +
-            `${family.title} ` +
-            `${check.reason}`
-          );
-        }
+        console.log(
+          `SKIP_FAMILY ` +
+            `family=${family.title} ` +
+            `reason=${check.reason}`
+        );
 
         continue;
       }
 
-     const writeResult =
-  await createDraftFamily(
-    auth,
-    family
-  );
+      const writeResult =
+        await createDraftFamily(
+          auth,
+          family
+        );
 
-const writtenSkus =
-  Array.isArray(
-    writeResult?.createdSkus
-  )
-    ? writeResult.createdSkus
-    : [];
+      const writtenSkus =
+        Array.isArray(
+          writeResult?.createdSkus
+        )
+          ? writeResult.createdSkus
+          : [];
 
-createdSkus +=
-  writtenSkus.length;
+      createdSkus +=
+        writtenSkus.length;
 
-if (
-  writeResult?.action ===
-  "CREATED_NEW_FAMILY"
-) {
-  createdProducts++;
-}
+      if (
+        writeResult?.action ===
+        "CREATED_NEW_FAMILY"
+      ) {
+        createdProducts++;
+      }
 
-if (
-  writeResult?.action ===
-  "ADDED_MISSING_VARIANTS"
-) {
-  console.log(
-    `MISSING_VARIANTS_ADDED ` +
-    `family=${family.title} ` +
-    `product=${writeResult.productId} ` +
-    `skus=${writtenSkus.join(",")}`
-  );
-}
+      if (
+        writeResult?.action ===
+        "ADDED_MISSING_VARIANTS"
+      ) {
+        console.log(
+          `MISSING_VARIANTS_ADDED ` +
+            `family=${family.title} ` +
+            `product=${writeResult.productId} ` +
+            `skus=${writtenSkus.join(",")}`
+        );
+      }
 
-if (
-  writeResult?.action ===
-  "SKIPPED_ALL_EXISTING"
-) {
-  console.log(
-    `FAMILY_ALREADY_COMPLETE ` +
-    `family=${family.title}`
-  );
-}
+      if (
+        writeResult?.action ===
+        "SKIPPED_ALL_EXISTING"
+      ) {
+        completedExistingFamilies++;
 
+        console.log(
+          `FAMILY_ALREADY_COMPLETE ` +
+            `family=${family.title}`
+        );
+      }
     } catch (err) {
+      const errorMessage =
+        err?.message ||
+        String(err);
+
+      /*
+      Shopify may reject a partial-family
+      addition when the existing product's
+      option structure is different from
+      the supplier family structure.
+
+      Shopify rejects this before creating
+      the requested variant. This specific
+      known condition is therefore skipped
+      so one incompatible legacy product
+      cannot stop the entire catalogue
+      reconciliation.
+      */
+      if (
+        errorMessage.includes(
+          "PARTIAL_VARIANT_WRITE_FAILED"
+        ) &&
+        errorMessage.includes(
+          "Option does not exist"
+        )
+      ) {
+        skippedOptionMismatch++;
+
+        console.log(
+          `SKIP_OPTION_MISMATCH ` +
+            `family=${family.title} ` +
+            `error=${errorMessage}`
+        );
+
+        continue;
+      }
+
+      /*
+      Everything else remains fail-closed.
+      */
       failed++;
 
       console.error(
         `WRITE_FAILED ` +
-        `family=${family.title} ` +
-        `error=${
-          err?.message ||
-          String(err)
-        }`
+          `family=${family.title} ` +
+          `error=${errorMessage}`
       );
 
-      /*
-        Fail closed after any
-        uncertain write.
-      */
+      console.error(
+        "FAIL_CLOSED_STOPPING_RUN"
+      );
+
       break;
     }
   }
@@ -1543,27 +1769,27 @@ if (
 
   console.log(
     `DRAFT_PRODUCTS_CREATED_VERIFIED=` +
-    `${createdProducts}`
+      `${createdProducts}`
   );
 
   console.log(
-    `DRAFT_SKUS_CREATED_VERIFIED=` +
-    `${createdSkus}`
+    `SKUS_CREATED_VERIFIED=` +
+      `${createdSkus}`
   );
 
   console.log(
-    `EXISTING_FAMILIES_SKIPPED=` +
-    `${skippedExistingFamily}`
+    `EXISTING_FAMILIES_COMPLETE=` +
+      `${completedExistingFamilies}`
   );
 
   console.log(
-    `COLLISION_FAMILIES_SKIPPED=` +
-    `${skippedCollisionFamily}`
+    `COLLISION_OR_UNSAFE_FAMILIES_SKIPPED=` +
+      `${skippedCollisionFamily}`
   );
 
   console.log(
-    `LIMIT_FAMILIES_SKIPPED=` +
-    `${skippedLimit}`
+    `OPTION_MISMATCH_FAMILIES_SKIPPED=` +
+      `${skippedOptionMismatch}`
   );
 
   console.log(
@@ -1581,15 +1807,6 @@ if (
   console.log(
     "PUBLISHED_PRODUCTS=0"
   );
-
-  if (
-    createdSkus >
-    TEST_SKU_LIMIT
-  ) {
-    throw new Error(
-      "TEST_SKU_LIMIT_BREACHED"
-    );
-  }
 }
 
 main().catch(err => {
