@@ -865,14 +865,6 @@ if (finalCheck.mode === "PARTIAL_EXISTING") {
       );
     }
 
-    missingVariants.push({
-      optionValues: [
-        {
-          optionName,
-          name: value
-        }
-      ],
-
      missingVariants.push({
   optionValues: [
     {
