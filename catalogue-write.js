@@ -886,13 +886,6 @@ if (finalCheck.mode === "PARTIAL_EXISTING") {
   taxable: false
 });
 
-      price:
-        String(
-          pricing(net).retail
-        ),
-
-      taxable: false
-    });
   }
 
   const partialMutation = `
