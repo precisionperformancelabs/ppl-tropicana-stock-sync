@@ -78,8 +78,6 @@ function hardBlocked(r) {
 
   // Non-negotiable nicotine/vape block.
   if (
-  // Non-negotiable nicotine/vape block.
-  if (
     t.includes("nicotine") ||
     t.includes("vape") ||
     t.includes("vaping") ||
