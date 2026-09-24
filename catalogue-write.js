@@ -873,10 +873,12 @@ if (finalCheck.mode === "PARTIAL_EXISTING") {
     }
   ],
 
-  inventoryItem: {
-    sku,
-    barcode: barcode || null
-  },
+inventoryItem: {
+  sku
+},
+barcode: barcode || null,
+price: String(pricing(net).retail),
+taxable: false
 
   price:
     String(
