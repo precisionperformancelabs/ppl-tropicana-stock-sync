@@ -68,6 +68,16 @@ function hardBlocked(r) {
     return "protected-brand";
   }
 
+  // Brands intentionally excluded from PPL catalogue.
+  if (
+    b === "barebells" ||
+    b === "natures aid"
+  ) {
+    return "excluded-brand";
+  }
+
+  // Non-negotiable nicotine/vape block.
+  if (
   // Non-negotiable nicotine/vape block.
   if (
     t.includes("nicotine") ||
@@ -865,10 +875,26 @@ if (finalCheck.mode === "PARTIAL_EXISTING") {
         }
       ],
 
-      sku,
+     missingVariants.push({
+  optionValues: [
+    {
+      optionName,
+      name: value
+    }
+  ],
 
-      barcode:
-        barcode || null,
+  inventoryItem: {
+    sku,
+    barcode: barcode || null
+  },
+
+  price:
+    String(
+      pricing(net).retail
+    ),
+
+  taxable: false
+});
 
       price:
         String(
