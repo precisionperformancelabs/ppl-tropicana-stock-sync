@@ -880,12 +880,6 @@ barcode: barcode || null,
 price: String(pricing(net).retail),
 taxable: false
 
-  price:
-    String(
-      pricing(net).retail
-    ),
-
-  taxable: false
 });
 
   }
