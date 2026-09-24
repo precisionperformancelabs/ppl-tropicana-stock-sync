@@ -536,41 +536,60 @@ async function preflightFamily(
   auth,
   family
 ) {
+  const existing = [];
+  const missing = [];
+
   for (const item of family.items) {
-    const sku =
-      clean(item.row.ProductCode);
+    const sku = clean(item.row.ProductCode);
+    const barcode = clean(item.row.Barcode);
 
-    const barcode =
-      clean(item.row.Barcode);
-
-    /*
-      Exact SKU protection.
-    */
     const skuMatches =
-      await exactSkuMatches(
-        auth,
-        sku
-      );
+      await exactSkuMatches(auth, sku);
 
     if (skuMatches.length > 1) {
       return {
         ok: false,
-        reason:
-          `duplicate-shopify-sku:${sku}`
+        reason: `duplicate-shopify-sku:${sku}`,
+        existing,
+        missing
       };
     }
 
     if (skuMatches.length === 1) {
-      return {
-        ok: false,
-        reason:
-          `existing-sku:${sku}`
-      };
+      const match = skuMatches[0];
+
+      /*
+      If the SKU already exists, make sure
+      the supplier barcode does not disagree
+      with the Shopify barcode.
+      */
+      if (
+        barcode &&
+        clean(match.barcode) &&
+        clean(match.barcode) !== barcode
+      ) {
+        return {
+          ok: false,
+          reason:
+            `existing-sku-barcode-mismatch:` +
+            `${sku}`,
+          existing,
+          missing
+        };
+      }
+
+      existing.push({
+        item,
+        match
+      });
+
+      continue;
     }
 
     /*
-      Global barcode collision
-      protection.
+    SKU is genuinely missing.
+    Make sure its barcode is not already
+    attached to another Shopify variant.
     */
     if (barcode) {
       const barcodeMatches =
@@ -579,29 +598,89 @@ async function preflightFamily(
           barcode
         );
 
-      if (
-        barcodeMatches.length > 0
-      ) {
+      if (barcodeMatches.length > 0) {
         return {
           ok: false,
           reason:
             `barcode-collision:` +
             `${barcode}:` +
             barcodeMatches
-              .map(
-                x => clean(x.sku)
-              )
-              .join(",")
+              .map(x => clean(x.sku))
+              .join(","),
+          existing,
+          missing
         };
       }
     }
+
+    missing.push(item);
+  }
+
+  /*
+  Work out what kind of family this is.
+  */
+  if (
+    existing.length === family.items.length
+  ) {
+    return {
+      ok: true,
+      mode: "ALL_EXISTING",
+      existing,
+      missing
+    };
+  }
+
+  if (existing.length === 0) {
+    return {
+      ok: true,
+      mode: "ALL_NEW",
+      existing,
+      missing
+    };
+  }
+
+  /*
+  A mixture is no longer treated as an
+  error. The write stage will deal with
+  only the genuinely missing variants.
+  */
+  return {
+    ok: true,
+    mode: "PARTIAL_EXISTING",
+    existing,
+    missing
+  };
+}
+function resolveExistingParent(preflight) {
+  const productIds = [
+    ...new Set(
+      preflight.existing
+        .map(x => clean(x.match?.product?.id))
+        .filter(Boolean)
+    )
+  ];
+
+  if (preflight.mode === "ALL_NEW") {
+    return {
+      ok: true,
+      productId: null
+    };
+  }
+
+  if (productIds.length !== 1) {
+    return {
+      ok: false,
+      reason:
+        `ambiguous-existing-parent:` +
+        productIds.join(",")
+    };
   }
 
   return {
-    ok: true
+    ok: true,
+    productId: productIds[0]
   };
 }
-
 async function createDraftFamily(
   auth,
   family
@@ -628,7 +707,23 @@ async function createDraftFamily(
       `${finalCheck.reason}`
     );
   }
+const parentCheck =
+  resolveExistingParent(finalCheck);
 
+if (!parentCheck.ok) {
+  throw new Error(
+    `PARENT_CHECK_FAILED ` +
+    `${parentCheck.reason}`
+  );
+}
+
+if (finalCheck.mode === "ALL_EXISTING") {
+  return {
+    action: "SKIPPED_ALL_EXISTING",
+    createdSkus: [],
+    productId: parentCheck.productId
+  };
+}
   const brand =
     clean(
       family.items[0].row.Brand
@@ -720,7 +815,188 @@ async function createDraftFamily(
       taxable: false
     });
   }
+if (finalCheck.mode === "PARTIAL_EXISTING") {
+  const missingItems = finalCheck.missing;
 
+  if (!parentCheck.productId) {
+    throw new Error(
+      "PARTIAL_EXISTING_WITHOUT_PARENT"
+    );
+  }
+
+  if (!missingItems.length) {
+    throw new Error(
+      "PARTIAL_EXISTING_WITHOUT_MISSING_ITEMS"
+    );
+  }
+
+  const missingVariants = [];
+
+  for (const item of missingItems) {
+    const r = item.row;
+
+    const sku =
+      clean(r.ProductCode);
+
+    const barcode =
+      clean(r.Barcode);
+
+    const net =
+      num(r.ProductPrice);
+
+    const value =
+      clean(item.optionValue);
+
+    if (
+      !sku ||
+      !(net > 0) ||
+      !value
+    ) {
+      throw new Error(
+        `UNSAFE_MISSING_VARIANT ${sku}`
+      );
+    }
+
+    missingVariants.push({
+      optionValues: [
+        {
+          optionName,
+          name: value
+        }
+      ],
+
+      sku,
+
+      barcode:
+        barcode || null,
+
+      price:
+        String(
+          pricing(net).retail
+        ),
+
+      taxable: false
+    });
+  }
+
+  const partialMutation = `
+    mutation AddMissingVariants(
+      $productId: ID!,
+      $variants: [ProductVariantsBulkInput!]!
+    ) {
+      productVariantsBulkCreate(
+        productId: $productId,
+        variants: $variants,
+        strategy: REMOVE_STANDALONE_VARIANT
+      ) {
+        productVariants {
+          id
+          sku
+          barcode
+          price
+        }
+        userErrors {
+          field
+          message
+        }
+      }
+    }
+  `;
+
+  const partialResult =
+    await gql(
+      auth,
+      partialMutation,
+      {
+        productId:
+          parentCheck.productId,
+        variants:
+          missingVariants
+      }
+    );
+
+  const payload =
+    partialResult
+      ?.productVariantsBulkCreate;
+
+  const errors =
+    payload?.userErrors || [];
+
+  if (errors.length) {
+    throw new Error(
+      `PARTIAL_VARIANT_WRITE_FAILED ` +
+      JSON.stringify(errors)
+    );
+  }
+
+  const created =
+    payload?.productVariants || [];
+
+  if (
+    created.length !==
+    missingVariants.length
+  ) {
+    throw new Error(
+      `PARTIAL_VARIANT_COUNT_MISMATCH ` +
+      `expected=${missingVariants.length} ` +
+      `created=${created.length}`
+    );
+  }
+
+  /*
+  Re-check every missing SKU after writing.
+  Each must now exist exactly once and belong
+  to the parent product we deliberately chose.
+  */
+  for (const item of missingItems) {
+    const sku =
+      clean(item.row.ProductCode);
+
+    const matches =
+      await exactSkuMatches(
+        auth,
+        sku
+      );
+
+    if (matches.length !== 1) {
+      throw new Error(
+        `PARTIAL_VERIFY_SKU_COUNT ` +
+        `${sku}:${matches.length}`
+      );
+    }
+
+    const actualProductId =
+      clean(
+        matches[0]
+          ?.product
+          ?.id
+      );
+
+    if (
+      actualProductId !==
+      parentCheck.productId
+    ) {
+      throw new Error(
+        `PARTIAL_VERIFY_WRONG_PARENT ` +
+        `${sku}`
+      );
+    }
+  }
+
+  return {
+    action:
+      "ADDED_MISSING_VARIANTS",
+    productId:
+      parentCheck.productId,
+    createdSkus:
+      missingItems.map(
+        item =>
+          clean(
+            item.row.ProductCode
+          )
+      )
+  };
+}
   const mutation = `
     mutation CreateControlledFamily(
       $input: ProductSetInput!
@@ -764,8 +1040,6 @@ async function createDraftFamily(
       "DRAFT",
 
     tags: [
-      "Tropicana",
-      "Tropicana Dropship",
       "PPL controlled import",
       "PPL V2 family import"
     ],
@@ -907,7 +1181,16 @@ async function createDraftFamily(
     })}`
   );
 
-  return product.id;
+return {
+  action: "CREATED_NEW_FAMILY",
+  productId: product.id,
+  createdSkus: family.items.map(
+    item =>
+      clean(
+        item.row.ProductCode
+      )
+  )
+};
 }
 
 async function main() {
@@ -1184,15 +1467,50 @@ async function main() {
         continue;
       }
 
-      await createDraftFamily(
-        auth,
-        family
-      );
+     const writeResult =
+  await createDraftFamily(
+    auth,
+    family
+  );
 
-      createdSkus +=
-        family.items.length;
+const writtenSkus =
+  Array.isArray(
+    writeResult?.createdSkus
+  )
+    ? writeResult.createdSkus
+    : [];
 
-      createdProducts++;
+createdSkus +=
+  writtenSkus.length;
+
+if (
+  writeResult?.action ===
+  "CREATED_NEW_FAMILY"
+) {
+  createdProducts++;
+}
+
+if (
+  writeResult?.action ===
+  "ADDED_MISSING_VARIANTS"
+) {
+  console.log(
+    `MISSING_VARIANTS_ADDED ` +
+    `family=${family.title} ` +
+    `product=${writeResult.productId} ` +
+    `skus=${writtenSkus.join(",")}`
+  );
+}
+
+if (
+  writeResult?.action ===
+  "SKIPPED_ALL_EXISTING"
+) {
+  console.log(
+    `FAMILY_ALREADY_COMPLETE ` +
+    `family=${family.title}`
+  );
+}
 
     } catch (err) {
       failed++;
