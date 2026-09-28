@@ -20,23 +20,31 @@ const shop = process.env.SHOPIFY_STORE_DOMAIN;
 const apiVersion = '2026-07';
 
 const BUILD_MARKER =
-  'PPL-STOCK-SYNC-2026-09-28-V3-TROPSHIP-ONLY';
+  'PPL-STOCK-SYNC-2026-09-28-V4-THROTTLE-SAFE';
 
+// PPL's own-stock location.
+// Tropicana products must NOT remain stocked here.
 const ownStockLocationId =
   'gid://shopify/Location/120937251150'; // "30"
 
+// All Tropicana/TropShip supplier inventory belongs here.
 const tropicanaDropshipLocationId =
-  'gid://shopify/Location/125063037262'; // Tropicana Dropship
+  'gid://shopify/Location/125063037262'; // "Tropicana Dropship"
 
+// Old Syncee stock must not contribute to Tropicana products.
 const synceeLocationId =
-  'gid://shopify/Location/124613067086'; // Syncee
+  'gid://shopify/Location/124613067086'; // "Syncee"
 
 const TARGET_SKUS = [
-  'APP486', // Black Stak
+  'APP486', // Applied Nutrition Black Stak
   'PER458',
   'PER459',
   'PER460'
 ];
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 function normaliseSku(value) {
   return String(value ?? '')
@@ -72,54 +80,161 @@ async function token() {
   return (await r.json()).access_token;
 }
 
-async function gql(accessToken, query, variables = {}) {
-  const r = await fetch(
-    `https://${shop}/admin/api/${apiVersion}/graphql.json`,
-    {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-shopify-access-token': accessToken
-      },
-      body: JSON.stringify({
-        query,
-        variables
-      })
-    }
-  );
+async function gql(
+  accessToken,
+  query,
+  variables = {}
+) {
+  const maxAttempts = 8;
 
-  const j = await r.json();
-
-  if (!r.ok || j.errors) {
-    throw new Error(
-      `Shopify GraphQL failed: ${
-        JSON.stringify(j.errors || j)
-      }`
+  for (
+    let attempt = 1;
+    attempt <= maxAttempts;
+    attempt++
+  ) {
+    const r = await fetch(
+      `https://${shop}/admin/api/${apiVersion}/graphql.json`,
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-shopify-access-token':
+            accessToken
+        },
+        body: JSON.stringify({
+          query,
+          variables
+        })
+      }
     );
+
+    const responseText =
+      await r.text();
+
+    let j;
+
+    try {
+      j = JSON.parse(responseText);
+    } catch {
+      throw new Error(
+        `Shopify returned invalid JSON: ` +
+        `${responseText.slice(0, 500)}`
+      );
+    }
+
+    const throttled =
+      r.status === 429 ||
+      (
+        Array.isArray(j.errors) &&
+        j.errors.some(
+          e =>
+            e?.extensions?.code ===
+            'THROTTLED'
+        )
+      );
+
+    if (throttled) {
+      if (
+        attempt === maxAttempts
+      ) {
+        throw new Error(
+          `Shopify GraphQL still throttled ` +
+          `after ${maxAttempts} attempts`
+        );
+      }
+
+      const throttle =
+        j.extensions?.cost
+          ?.throttleStatus;
+
+      const requested =
+        j.extensions?.cost
+          ?.requestedQueryCost ?? 100;
+
+      const available =
+        throttle
+          ?.currentlyAvailable ?? 0;
+
+      const restoreRate =
+        throttle
+          ?.restoreRate ?? 50;
+
+      const deficit =
+        Math.max(
+          1,
+          requested - available
+        );
+
+      const calculatedWait =
+        Math.ceil(
+          (deficit / restoreRate) *
+          1000
+        ) + 500;
+
+      const waitMs =
+        Math.max(
+          1000,
+          Math.min(
+            15000,
+            calculatedWait
+          )
+        );
+
+      console.warn(
+        `SHOPIFY_THROTTLED ` +
+        `attempt=${attempt}/${maxAttempts} ` +
+        `waiting_ms=${waitMs}`
+      );
+
+      await sleep(waitMs);
+
+      continue;
+    }
+
+    if (!r.ok || j.errors) {
+      throw new Error(
+        `Shopify GraphQL failed: ` +
+        `${JSON.stringify(
+          j.errors || j
+        )}`
+      );
+    }
+
+    return j.data;
   }
 
-  return j.data;
+  throw new Error(
+    'Shopify GraphQL retry loop ended unexpectedly'
+  );
 }
 
-function records(node, out = []) {
+function records(
+  node,
+  out = []
+) {
   if (Array.isArray(node)) {
     for (const v of node) {
       records(v, out);
     }
+
   } else if (
     node &&
     typeof node === 'object'
   ) {
     if (
-      Object.prototype.hasOwnProperty.call(
-        node,
-        'ProductCode'
-      )
+      Object.prototype
+        .hasOwnProperty.call(
+          node,
+          'ProductCode'
+        )
     ) {
       out.push(node);
     }
 
-    for (const v of Object.values(node)) {
+    for (
+      const v of
+      Object.values(node)
+    ) {
       records(v, out);
     }
   }
@@ -139,26 +254,29 @@ function feedQuantity(row) {
     'QtyInStock'
   ];
 
-  const present = keys.filter(
-    k =>
-      Object.prototype.hasOwnProperty.call(
-        row,
-        k
-      )
-  );
+  const present =
+    keys.filter(
+      k =>
+        Object.prototype
+          .hasOwnProperty.call(
+            row,
+            k
+          )
+    );
 
   if (present.length !== 1) {
     throw new Error(
-      `Unsafe stock fields for ${
-        row.ProductCode
-      }: ${
-        present.join(',') || 'none'
-      }; keys=${Object.keys(row).join(',')}`
+      `Unsafe stock fields for ` +
+      `${row.ProductCode}: ` +
+      `${present.join(',') || 'none'}; ` +
+      `keys=${Object.keys(row).join(',')}`
     );
   }
 
   const raw =
-    String(row[present[0]]).trim();
+    String(
+      row[present[0]]
+    ).trim();
 
   if (
     /^(out\s*of\s*stock|no|false|none)$/i
@@ -167,25 +285,29 @@ function feedQuantity(row) {
     return 0;
   }
 
-  if (!/^-?\d+(?:\.0+)?$/.test(raw)) {
+  if (
+    !/^-?\d+(?:\.0+)?$/
+      .test(raw)
+  ) {
     throw new Error(
-      `Invalid quantity for ${
-        row.ProductCode
-      }: field=${present[0]} ` +
+      `Invalid quantity for ` +
+      `${row.ProductCode}: ` +
+      `field=${present[0]} ` +
       `value=${JSON.stringify(raw)}`
     );
   }
 
-  const n = Number(raw);
+  const n =
+    Number(raw);
 
   if (
     !Number.isSafeInteger(n) ||
     n > 1000000
   ) {
     throw new Error(
-      `Invalid quantity for ${
-        row.ProductCode
-      }: field=${present[0]} ` +
+      `Invalid quantity for ` +
+      `${row.ProductCode}: ` +
+      `field=${present[0]} ` +
       `value=${JSON.stringify(raw)}`
     );
   }
@@ -203,7 +325,8 @@ function feedQuantity(row) {
 }
 
 async function supplierFeed() {
-  const s = new SFTP();
+  const s =
+    new SFTP();
 
   try {
     await s.connect({
@@ -211,9 +334,11 @@ async function supplierFeed() {
         'tropicana.ftp.redtechnology.com',
       port: 22,
       username:
-        process.env.TROPICANA_SFTP_USER,
+        process.env
+          .TROPICANA_SFTP_USER,
       password:
-        process.env.TROPICANA_SFTP_PASSWORD,
+        process.env
+          .TROPICANA_SFTP_PASSWORD,
       readyTimeout: 30000
     });
 
@@ -226,37 +351,111 @@ async function supplierFeed() {
       new XMLParser({
         trimValues: true,
         parseTagValue: false
-      }).parse(b.toString());
+      }).parse(
+        b.toString()
+      );
 
-    const rows = records(parsed);
+    const rows =
+      records(parsed);
 
-    const map = new Map();
-    const duplicateCodes = new Set();
+    const map =
+      new Map();
+
+    const duplicateCodes =
+      new Set();
+
     const conflictingDuplicates =
       new Set();
 
     for (const row of rows) {
       const sku =
-        normaliseSku(row.ProductCode);
+        normaliseSku(
+          row.ProductCode
+        );
 
-      if (!sku) continue;
+      if (!sku) {
+        continue;
+      }
 
-      const qty = feedQuantity(row);
+      const qty =
+        feedQuantity(row);
+
+      /*
+       * Diagnostic:
+       * show the actual stock field
+       * Tropicana supplies for our
+       * test SKUs, including APP486.
+       */
+      if (
+        TARGET_SKUS.includes(sku)
+      ) {
+        const stockFields = {};
+
+        for (
+          const key of [
+            'StockLevel',
+            'StockQuantity',
+            'StockQty',
+            'FreeStock',
+            'AvailableStock',
+            'QuantityAvailable',
+            'AvailableQuantity',
+            'QtyInStock'
+          ]
+        ) {
+          if (
+            Object.prototype
+              .hasOwnProperty.call(
+                row,
+                key
+              )
+          ) {
+            stockFields[key] =
+              row[key];
+          }
+        }
+
+        console.log(
+          `TARGET_FEED_ROW ` +
+          `sku=${sku} ` +
+          `stock_fields=` +
+          `${JSON.stringify(
+            stockFields
+          )}`
+        );
+      }
 
       if (!map.has(sku)) {
-        map.set(sku, qty);
+        map.set(
+          sku,
+          qty
+        );
+
         continue;
       }
 
       duplicateCodes.add(sku);
 
-      if (map.get(sku) !== qty) {
-        conflictingDuplicates.add(sku);
+      if (
+        map.get(sku) !== qty
+      ) {
+        conflictingDuplicates
+          .add(sku);
       }
     }
 
+    /*
+     * Tropicana repeats ProductCode
+     * rows across categories.
+     *
+     * Keep duplicate rows where
+     * stock agrees.
+     *
+     * Block only genuine conflicts.
+     */
     for (
-      const sku of conflictingDuplicates
+      const sku of
+      conflictingDuplicates
     ) {
       map.delete(sku);
     }
@@ -282,7 +481,9 @@ async function supplierFeed() {
 
 function isTropicanaVariant(v) {
   const tags =
-    Array.isArray(v.product?.tags)
+    Array.isArray(
+      v.product?.tags
+    )
       ? v.product.tags
       : [];
 
@@ -291,27 +492,40 @@ function isTropicanaVariant(v) {
       String(tag).trim();
 
     return (
-      /^Supplier:Tropicana$/i.test(t) ||
-      /^Tropicana Feed$/i.test(t) ||
-      /^Tropicana Dropship$/i.test(t)
+      /^Supplier:Tropicana$/i
+        .test(t) ||
+
+      /^Tropicana Feed$/i
+        .test(t) ||
+
+      /^Tropicana Dropship$/i
+        .test(t)
     );
   });
 }
 
 function availableAt(level) {
-  if (!level) return null;
+  if (!level) {
+    return null;
+  }
 
   const q =
-    level.quantities?.find(
-      x => x.name === 'available'
-    )?.quantity;
+    level.quantities
+      ?.find(
+        x =>
+          x.name ===
+          'available'
+      )
+      ?.quantity;
 
   return Number.isInteger(q)
     ? q
     : null;
 }
 
-async function variants(accessToken) {
+async function variants(
+  accessToken
+) {
   const query = `
     query Variants(
       $after:String,
@@ -320,7 +534,7 @@ async function variants(accessToken) {
       $synceeLocationId:ID!
     ) {
       productVariants(
-        first:100,
+        first:50,
         after:$after
       ) {
         nodes {
@@ -332,9 +546,11 @@ async function variants(accessToken) {
             tracked
 
             ownStock:inventoryLevel(
-              locationId:$ownStockLocationId
+              locationId:
+                $ownStockLocationId
             ) {
               id
+
               quantities(
                 names:["available"]
               ) {
@@ -348,6 +564,7 @@ async function variants(accessToken) {
                 $tropicanaDropshipLocationId
             ) {
               id
+
               quantities(
                 names:["available"]
               ) {
@@ -357,9 +574,11 @@ async function variants(accessToken) {
             }
 
             syncee:inventoryLevel(
-              locationId:$synceeLocationId
+              locationId:
+                $synceeLocationId
             ) {
               id
+
               quantities(
                 names:["available"]
               ) {
@@ -387,6 +606,7 @@ async function variants(accessToken) {
 
   const all = [];
   let after = null;
+  let page = 0;
 
   do {
     const d =
@@ -405,14 +625,39 @@ async function variants(accessToken) {
       ...d.productVariants.nodes
     );
 
+    page++;
+
+    console.log(
+      `SHOPIFY_VARIANTS_PAGE ` +
+      `page=${page} ` +
+      `fetched=` +
+      `${d.productVariants.nodes.length} ` +
+      `total=${all.length}`
+    );
+
     after =
-      d.productVariants.pageInfo
+      d.productVariants
+        .pageInfo
         .hasNextPage
-        ? d.productVariants.pageInfo
+        ? d.productVariants
+            .pageInfo
             .endCursor
         : null;
 
+    /*
+     * Give Shopify breathing room
+     * between catalogue pages.
+     */
+    if (after) {
+      await sleep(300);
+    }
+
   } while (after);
+
+  console.log(
+    `SHOPIFY_VARIANTS_COMPLETE ` +
+    `total=${all.length}`
+  );
 
   return all;
 }
@@ -427,7 +672,9 @@ async function readAvailable(
       $id:ID!,
       $locationId:ID!
     ) {
-      inventoryItem(id:$id) {
+      inventoryItem(
+        id:$id
+      ) {
         inventoryLevel(
           locationId:$locationId
         ) {
@@ -447,7 +694,9 @@ async function readAvailable(
       accessToken,
       query,
       {
-        id: inventoryItemId,
+        id:
+          inventoryItemId,
+
         locationId
       }
     );
@@ -490,7 +739,9 @@ async function setTracking(
       accessToken,
       mutation,
       {
-        id: inventoryItemId,
+        id:
+          inventoryItemId,
+
         input: {
           tracked
         }
@@ -504,16 +755,17 @@ async function setTracking(
   if (errs.length) {
     throw new Error(
       `Tracking update failed: ` +
-      JSON.stringify(errs)
+      `${JSON.stringify(errs)}`
     );
   }
 
   if (
     d.inventoryItemUpdate
-      .inventoryItem?.tracked !== tracked
+      .inventoryItem
+      ?.tracked !== tracked
   ) {
     throw new Error(
-      `Tracking read-back mismatch`
+      'Tracking read-back mismatch'
     );
   }
 }
@@ -535,8 +787,9 @@ async function setQuantity(
       inventorySetQuantities(
         input:$input
       )
-      @idempotent(key:$key) {
-
+      @idempotent(
+        key:$key
+      ) {
         inventoryAdjustmentGroup {
           changes {
             name
@@ -554,8 +807,11 @@ async function setQuantity(
   `;
 
   const input = {
-    name: 'available',
-    reason: 'correction',
+    name:
+      'available',
+
+    reason:
+      'correction',
 
     referenceDocumentUri:
       `gid://ppl-tropicana-sync/` +
@@ -566,6 +822,7 @@ async function setQuantity(
         inventoryItemId,
         locationId,
         quantity,
+
         changeFromQuantity:
           compareQuantity
       }
@@ -578,7 +835,9 @@ async function setQuantity(
       mutation,
       {
         input,
-        key: crypto.randomUUID()
+
+        key:
+          crypto.randomUUID()
       }
     );
 
@@ -624,11 +883,16 @@ async function activateAtDropship(
       inventoryActivate(
         inventoryItemId:
           $inventoryItemId,
-        locationId:$locationId,
-        available:$available
-      )
-      @idempotent(key:$key) {
 
+        locationId:
+          $locationId,
+
+        available:
+          $available
+      )
+      @idempotent(
+        key:$key
+      ) {
         inventoryLevel {
           id
 
@@ -654,10 +918,15 @@ async function activateAtDropship(
       mutation,
       {
         inventoryItemId,
+
         locationId:
           tropicanaDropshipLocationId,
-        available: quantity,
-        key: crypto.randomUUID()
+
+        available:
+          quantity,
+
+        key:
+          crypto.randomUUID()
       }
     );
 
@@ -703,6 +972,7 @@ async function deactivateLocation(
       inventoryBulkToggleActivation(
         inventoryItemId:
           $inventoryItemId,
+
         inventoryItemUpdates:
           $updates
       ) {
@@ -724,6 +994,7 @@ async function deactivateLocation(
       mutation,
       {
         inventoryItemId,
+
         updates: [
           {
             locationId,
@@ -739,8 +1010,9 @@ async function deactivateLocation(
 
   if (errs.length) {
     throw new Error(
-      `Failed to deactivate ${label}: ` +
-      JSON.stringify(errs)
+      `Failed to deactivate ` +
+      `${label}: ` +
+      `${JSON.stringify(errs)}`
     );
   }
 
@@ -753,25 +1025,26 @@ async function deactivateLocation(
 
   if (actual !== null) {
     throw new Error(
-      `${label} still active after ` +
-      `deactivation; quantity=${actual}`
+      `${label} still active ` +
+      `after deactivation; ` +
+      `quantity=${actual}`
     );
   }
 }
 
 (async () => {
-
   console.log(
-    `BUILD_MARKER ${BUILD_MARKER}`
+    `BUILD_MARKER ` +
+    `${BUILD_MARKER}`
   );
 
   const feed =
     await supplierFeed();
 
   /*
-   * Always show us exactly what the
-   * supplier feed says for known
-   * diagnostic SKUs.
+   * Always report exactly what
+   * Tropicana's feed says for
+   * our diagnostic SKUs.
    */
   for (
     const sku of TARGET_SKUS
@@ -791,12 +1064,13 @@ async function deactivateLocation(
     await token();
 
   const all =
-    await variants(accessToken);
+    await variants(
+      accessToken
+    );
 
   /*
-   * Diagnostic output for APP486 etc,
-   * even if the supplier feed doesn't
-   * contain them.
+   * Show Shopify state for the
+   * same diagnostic SKUs.
    */
   for (
     const targetSku
@@ -805,11 +1079,14 @@ async function deactivateLocation(
     const targetMatches =
       all.filter(
         v =>
-          normaliseSku(v.sku) ===
-          targetSku
+          normaliseSku(
+            v.sku
+          ) === targetSku
       );
 
-    if (!targetMatches.length) {
+    if (
+      !targetMatches.length
+    ) {
       console.log(
         `TARGET_SHOPIFY ` +
         `sku=${targetSku} ` +
@@ -818,39 +1095,43 @@ async function deactivateLocation(
     }
 
     for (
-      const v of targetMatches
+      const v
+      of targetMatches
     ) {
       console.log(
         `TARGET_SHOPIFY ` +
         `sku=${targetSku} ` +
+
         `title=${JSON.stringify(
           v.product?.title || ''
         )} ` +
-        `status=${v.product?.status} ` +
-        `tropicana=${
-          isTropicanaVariant(v)
-        } ` +
-        `tracked=${
-          v.inventoryItem?.tracked
-        } ` +
-        `dropship=${
-          availableAt(
-            v.inventoryItem
-              ?.dropship
-          )
-        } ` +
-        `own30=${
-          availableAt(
-            v.inventoryItem
-              ?.ownStock
-          )
-        } ` +
-        `syncee=${
-          availableAt(
-            v.inventoryItem
-              ?.syncee
-          )
-        }`
+
+        `status=` +
+        `${v.product?.status} ` +
+
+        `tropicana=` +
+        `${isTropicanaVariant(v)} ` +
+
+        `tracked=` +
+        `${v.inventoryItem?.tracked} ` +
+
+        `dropship=` +
+        `${availableAt(
+          v.inventoryItem
+            ?.dropship
+        )} ` +
+
+        `own30=` +
+        `${availableAt(
+          v.inventoryItem
+            ?.ownStock
+        )} ` +
+
+        `syncee=` +
+        `${availableAt(
+          v.inventoryItem
+            ?.syncee
+        )}`
       );
     }
   }
@@ -862,32 +1143,44 @@ async function deactivateLocation(
     new Set();
 
   for (const v of all) {
-
     /*
-     * CRITICAL FIX:
-     * Never touch a non-Tropicana product
-     * merely because its SKU exists in
-     * the Tropicana feed.
+     * CRITICAL:
+     * Never touch a non-Tropicana
+     * product merely because its
+     * SKU exists in the Tropicana
+     * supplier feed.
      */
-    if (!isTropicanaVariant(v)) {
+    if (
+      !isTropicanaVariant(v)
+    ) {
       continue;
     }
 
     const sku =
-      normaliseSku(v.sku);
+      normaliseSku(
+        v.sku
+      );
 
     if (!sku) {
       continue;
     }
 
-    tropicanaStoreSkus.add(sku);
+    tropicanaStoreSkus
+      .add(sku);
 
-    if (!feed.has(sku)) {
+    if (
+      !feed.has(sku)
+    ) {
       continue;
     }
 
-    if (!bySku.has(sku)) {
-      bySku.set(sku, []);
+    if (
+      !bySku.has(sku)
+    ) {
+      bySku.set(
+        sku,
+        []
+      );
     }
 
     bySku
@@ -899,7 +1192,8 @@ async function deactivateLocation(
     [...feed.keys()]
       .filter(
         sku =>
-          !tropicanaStoreSkus.has(sku)
+          !tropicanaStoreSkus
+            .has(sku)
       );
 
   const shopifyWithoutFeed =
@@ -926,7 +1220,6 @@ async function deactivateLocation(
   let blocked = 0;
 
   let trackingEnabled = 0;
-
   let dropshipActivated = 0;
 
   let ownStockDeactivated = 0;
@@ -936,278 +1229,7 @@ async function deactivateLocation(
     const [sku, list]
       of bySku
   ) {
-
     const active =
       list.filter(
         v =>
-          v.product.status ===
-          'ACTIVE'
-      );
-
-    if (active.length !== 1) {
-      console.error(
-        `BLOCKED ` +
-        `sku=${sku} ` +
-        `active_matches=` +
-        `${active.length} ` +
-        `all_tropicana_matches=` +
-        `${list.length}`
-      );
-
-      blocked++;
-      continue;
-    }
-
-    const v = active[0];
-
-    const wanted =
-      feed.get(sku);
-
-    let productChanged =
-      false;
-
-    try {
-
-      /*
-       * FIX:
-       * Don't abandon an imported product
-       * just because tracking was off.
-       */
-      if (
-        !v.inventoryItem
-          ?.tracked
-      ) {
-        await setTracking(
-          accessToken,
-          v.inventoryItem.id,
-          true
-        );
-
-        console.log(
-          `TRACKING_ENABLED ` +
-          `sku=${sku}`
-        );
-
-        trackingEnabled++;
-        productChanged = true;
-      }
-
-      let dropshipCurrent =
-        availableAt(
-          v.inventoryItem
-            ?.dropship
-        );
-
-      const ownStockCurrent =
-        availableAt(
-          v.inventoryItem
-            ?.ownStock
-        );
-
-      const synceeCurrent =
-        availableAt(
-          v.inventoryItem
-            ?.syncee
-        );
-
-      if (
-        TARGET_SKUS.includes(sku)
-      ) {
-        console.log(
-          `TARGET_BEFORE ` +
-          `sku=${sku} ` +
-          `wanted=${wanted} ` +
-          `dropship=` +
-          `${dropshipCurrent} ` +
-          `own30=` +
-          `${ownStockCurrent} ` +
-          `syncee=` +
-          `${synceeCurrent}`
-        );
-      }
-
-      /*
-       * Tropicana stock belongs ONLY
-       * at Tropicana Dropship.
-       */
-      if (
-        dropshipCurrent === null
-      ) {
-        await activateAtDropship(
-          accessToken,
-          v.inventoryItem.id,
-          wanted
-        );
-
-        console.log(
-          `DROPSHIP_ACTIVATED ` +
-          `sku=${sku} ` +
-          `quantity=${wanted}`
-        );
-
-        dropshipActivated++;
-        changed++;
-        productChanged = true;
-
-        dropshipCurrent =
-          wanted;
-
-      } else if (
-        dropshipCurrent !== wanted
-      ) {
-
-        await setQuantity(
-          accessToken,
-          v.inventoryItem.id,
-          tropicanaDropshipLocationId,
-          wanted,
-          dropshipCurrent,
-          'Tropicana Dropship'
-        );
-
-        console.log(
-          `VERIFIED ` +
-          `sku=${sku} ` +
-          `location=` +
-          `Tropicana Dropship ` +
-          `from=${dropshipCurrent} ` +
-          `to=${wanted}`
-        );
-
-        changed++;
-        productChanged = true;
-      }
-
-      /*
-       * FIX:
-       * Don't merely set "30" to zero.
-       * Remove Tropicana products from
-       * location 30 entirely.
-       */
-      if (
-        v.inventoryItem
-          ?.ownStock !== null
-      ) {
-
-        await deactivateLocation(
-          accessToken,
-          v.inventoryItem.id,
-          ownStockLocationId,
-          '30'
-        );
-
-        console.log(
-          `WRONG_LOCATION_DEACTIVATED ` +
-          `sku=${sku} ` +
-          `location=30`
-        );
-
-        ownStockDeactivated++;
-        productChanged = true;
-      }
-
-      /*
-       * Remove old Syncee location from
-       * Tropicana products entirely.
-       */
-      if (
-        v.inventoryItem
-          ?.syncee !== null
-      ) {
-
-        await deactivateLocation(
-          accessToken,
-          v.inventoryItem.id,
-          synceeLocationId,
-          'Syncee'
-        );
-
-        console.log(
-          `STALE_LOCATION_DEACTIVATED ` +
-          `sku=${sku} ` +
-          `location=Syncee`
-        );
-
-        synceeDeactivated++;
-        productChanged = true;
-      }
-
-      if (
-        TARGET_SKUS.includes(sku)
-      ) {
-
-        const afterDropship =
-          await readAvailable(
-            accessToken,
-            v.inventoryItem.id,
-            tropicanaDropshipLocationId
-          );
-
-        const afterOwn30 =
-          await readAvailable(
-            accessToken,
-            v.inventoryItem.id,
-            ownStockLocationId
-          );
-
-        const afterSyncee =
-          await readAvailable(
-            accessToken,
-            v.inventoryItem.id,
-            synceeLocationId
-          );
-
-        console.log(
-          `TARGET_AFTER ` +
-          `sku=${sku} ` +
-          `dropship=` +
-          `${afterDropship} ` +
-          `own30=` +
-          `${afterOwn30} ` +
-          `syncee=` +
-          `${afterSyncee}`
-        );
-      }
-
-      if (!productChanged) {
-        unchanged++;
-      }
-
-    } catch (e) {
-
-      console.error(
-        `BLOCKED ` +
-        `sku=${sku} ` +
-        `update_failed=` +
-        `${e.message}`
-      );
-
-      blocked++;
-    }
-  }
-
-  console.log(
-    `SYNC_COMPLETE ` +
-    `changed=${changed} ` +
-    `unchanged=${unchanged} ` +
-    `tracking_enabled=` +
-    `${trackingEnabled} ` +
-    `dropship_activated=` +
-    `${dropshipActivated} ` +
-    `own_location_deactivated=` +
-    `${ownStockDeactivated} ` +
-    `syncee_deactivated=` +
-    `${synceeDeactivated} ` +
-    `blocked=${blocked} ` +
-    `matched_skus=${bySku.size}`
-  );
-
-})().catch(e => {
-
-  console.error(
-    'SYNC_FAILED',
-    e.stack || e
-  );
-
-  process.exit(1);
-});
+          v.product.status
