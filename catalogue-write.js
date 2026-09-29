@@ -1,7 +1,7 @@
 "use strict";
 
 /*
-PPL CONTROLLED CATALOGUE WRITER V3
+PPL CONTROLLED CATALOGUE WRITER V3.1
 
 FULL ELIGIBLE CATALOGUE RECONCILIATION
 
@@ -12,7 +12,17 @@ FULL ELIGIBLE CATALOGUE RECONCILIATION
 - Existing option-structure mismatches are logged and skipped
 - ZERO inventory writes
 - ZERO order calls
-- ZERO publishing calls
+
+PUBLICATION SAFETY FIX:
+- New products remain DRAFT
+- DRAFT products are NEVER automatically published
+- ACTIVE controlled Tropicana products are checked
+- If ACTIVE but missing Online Store publication, publication is repaired
+- Publication is independently verified
+- Current PPL controlled-import tags are covered
+- Older Supplier:Tropicana products are also covered
+
+OTHER SAFETY:
 - Exact SKU protection immediately before writes
 - Global barcode collision protection
 - Hard nicotine / vape / alcohol block
@@ -28,6 +38,16 @@ const SFTP = require("ssh2-sftp-client");
 const { XMLParser } = require("fast-xml-parser");
 
 const SHOPIFY_API_VERSION = "2026-07";
+
+/*
+Verified PPL Online Store publication.
+
+This can be overridden later in Render by setting:
+SHOPIFY_ONLINE_STORE_PUBLICATION_ID
+*/
+const ONLINE_STORE_PUBLICATION_ID =
+  process.env.SHOPIFY_ONLINE_STORE_PUBLICATION_ID ||
+  "gid://shopify/Publication/352340443470";
 
 function clean(v) {
   return String(v ?? "").trim();
@@ -48,6 +68,13 @@ function money(v) {
   return Math.round((v + Number.EPSILON) * 100) / 100;
 }
 
+/*
+IMPORTANT:
+This pricing function is intentionally unchanged from
+the version you pasted.
+
+We are fixing publication in this commit only.
+*/
 function pricing(net) {
   const vat = net * 1.2;
   const landed = vat + 6;
@@ -157,8 +184,8 @@ function ordinaryExcluded(r) {
   }
 
   /*
-  Word boundaries prevent a flavour
-  such as Watermelon being blocked.
+  Word boundaries prevent Watermelon
+  being blocked by the water rule.
   */
   if (/\bwater\b/.test(t)) {
     return "water";
@@ -606,8 +633,16 @@ async function gql(
       }
     );
 
-  const json =
-    await res.json();
+  let json;
+
+  try {
+    json =
+      await res.json();
+  } catch (_) {
+    throw new Error(
+      `Shopify GraphQL returned invalid JSON HTTP ${res.status}`
+    );
+  }
 
   if (!res.ok) {
     throw new Error(
@@ -627,6 +662,351 @@ async function gql(
   }
 
   return json.data;
+}
+
+/*
+============================================================
+SELF-HEALING ONLINE STORE PUBLICATION GUARD
+============================================================
+
+This is the permanent repair for:
+
+Product status = ACTIVE
+but
+Online Store publication = missing
+
+Rules:
+- DRAFT stays DRAFT
+- ARCHIVED stays ARCHIVED
+- Only ACTIVE products are eligible
+- Only controlled Tropicana products are checked
+- Exact Online Store publication is verified after repair
+*/
+async function repairActiveControlledPublications(
+  auth
+) {
+  const searches = [
+    'status:active AND tag:"PPL controlled import"',
+    'status:active AND tag:"Supplier:Tropicana"'
+  ];
+
+  const auditQuery = `
+    query ControlledPublicationAudit(
+      $search: String!,
+      $after: String,
+      $publicationId: ID!
+    ) {
+      products(
+        first: 50,
+        after: $after,
+        query: $search
+      ) {
+        nodes {
+          id
+          title
+          status
+          publishedAt
+          publishedOnPublication(
+            publicationId: $publicationId
+          )
+        }
+
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+  `;
+
+  const publishMutation = `
+    mutation PublishControlledProduct(
+      $id: ID!,
+      $publicationId: ID!,
+      $input: [PublicationInput!]!
+    ) {
+      publishablePublish(
+        id: $id,
+        input: $input
+      ) {
+        publishable {
+          ... on Product {
+            id
+            title
+            status
+            publishedAt
+            publishedOnPublication(
+              publicationId: $publicationId
+            )
+          }
+        }
+
+        userErrors {
+          field
+          message
+        }
+      }
+    }
+  `;
+
+  const verifyQuery = `
+    query VerifyOnlineStorePublication(
+      $id: ID!,
+      $publicationId: ID!
+    ) {
+      product(
+        id: $id
+      ) {
+        id
+        title
+        status
+        publishedAt
+        publishedOnPublication(
+          publicationId: $publicationId
+        )
+      }
+    }
+  `;
+
+  const seen =
+    new Set();
+
+  let checked =
+    0;
+
+  let repaired =
+    0;
+
+  for (
+    const search
+    of searches
+  ) {
+    let after =
+      null;
+
+    do {
+      const data =
+        await gql(
+          auth,
+          auditQuery,
+          {
+            search,
+            after,
+
+            publicationId:
+              ONLINE_STORE_PUBLICATION_ID
+          }
+        );
+
+      const products =
+        data
+          ?.products
+          ?.nodes ||
+        [];
+
+      for (
+        const product
+        of products
+      ) {
+        if (
+          !product?.id
+        ) {
+          continue;
+        }
+
+        /*
+        The same product may have both
+        legacy and V3 tags.
+        */
+        if (
+          seen.has(
+            product.id
+          )
+        ) {
+          continue;
+        }
+
+        seen.add(
+          product.id
+        );
+
+        checked++;
+
+        /*
+        HARD SAFETY BARRIER.
+        */
+        if (
+          product.status !==
+          "ACTIVE"
+        ) {
+          continue;
+        }
+
+        /*
+        Already correctly published.
+        */
+        if (
+          product
+            .publishedOnPublication ===
+          true
+        ) {
+          continue;
+        }
+
+        console.log(
+          `PUBLICATION_REPAIR_REQUIRED ` +
+            `product=${product.id} ` +
+            `title=${product.title}`
+        );
+
+        const result =
+          await gql(
+            auth,
+            publishMutation,
+            {
+              id:
+                product.id,
+
+              publicationId:
+                ONLINE_STORE_PUBLICATION_ID,
+
+              input: [
+                {
+                  publicationId:
+                    ONLINE_STORE_PUBLICATION_ID
+                }
+              ]
+            }
+          );
+
+        const payload =
+          result
+            ?.publishablePublish;
+
+        const errors =
+          payload
+            ?.userErrors ||
+          [];
+
+        if (
+          errors.length
+        ) {
+          throw new Error(
+            `PUBLICATION_REPAIR_FAILED ` +
+              `product=${product.id} ` +
+              `errors=${JSON.stringify(
+                errors
+              )}`
+          );
+        }
+
+        const published =
+          payload
+            ?.publishable;
+
+        if (
+          !published ||
+          published.status !==
+            "ACTIVE" ||
+          published
+            .publishedOnPublication !==
+            true ||
+          !published.publishedAt
+        ) {
+          throw new Error(
+            `PUBLICATION_MUTATION_VERIFY_FAILED ` +
+              `product=${product.id}`
+          );
+        }
+
+        /*
+        Independent second Shopify read.
+        Do not rely only on mutation response.
+        */
+        const verification =
+          await gql(
+            auth,
+            verifyQuery,
+            {
+              id:
+                product.id,
+
+              publicationId:
+                ONLINE_STORE_PUBLICATION_ID
+            }
+          );
+
+        const verified =
+          verification
+            ?.product;
+
+        if (
+          !verified ||
+          verified.status !==
+            "ACTIVE" ||
+          verified
+            .publishedOnPublication !==
+            true ||
+          !verified.publishedAt
+        ) {
+          throw new Error(
+            `PUBLICATION_FINAL_VERIFY_FAILED ` +
+              `product=${product.id}`
+          );
+        }
+
+        repaired++;
+
+        console.log(
+          `PUBLICATION_REPAIRED_VERIFIED ` +
+            `${JSON.stringify({
+              productId:
+                verified.id,
+
+              title:
+                verified.title,
+
+              status:
+                verified.status,
+
+              publishedAt:
+                verified.publishedAt
+            })}`
+        );
+      }
+
+      const pageInfo =
+        data
+          ?.products
+          ?.pageInfo;
+
+      if (
+        pageInfo
+          ?.hasNextPage &&
+        pageInfo
+          ?.endCursor
+      ) {
+        after =
+          pageInfo.endCursor;
+      } else {
+        after =
+          null;
+      }
+
+    } while (after);
+  }
+
+  console.log(
+    `PUBLICATION_GUARD_CHECKED=${checked}`  );
+
+  console.log(
+    `PUBLICATION_GUARD_REPAIRED=${repaired}`
+  );
+
+  return {
+    checked,
+    repaired
+  };
 }
 
 function searchEscape(v) {
@@ -657,6 +1037,7 @@ async function exactSkuMatches(
           id
           sku
           barcode
+
           product {
             id
             title
@@ -713,6 +1094,7 @@ async function exactBarcodeMatches(
           id
           sku
           barcode
+
           product {
             id
             title
@@ -750,8 +1132,11 @@ async function preflightFamily(
   auth,
   family
 ) {
-  const existing = [];
-  const missing = [];
+  const existing =
+    [];
+
+  const missing =
+    [];
 
   for (
     const item
@@ -765,7 +1150,8 @@ async function preflightFamily(
 
     const barcode =
       clean(
-        item.row.Barcode
+        item.row
+          .Barcode
       );
 
     const skuMatches =
@@ -775,7 +1161,8 @@ async function preflightFamily(
       );
 
     if (
-      skuMatches.length > 1
+      skuMatches.length >
+      1
     ) {
       return {
         ok:
@@ -790,7 +1177,8 @@ async function preflightFamily(
     }
 
     if (
-      skuMatches.length === 1
+      skuMatches.length ===
+      1
     ) {
       const match =
         skuMatches[0];
@@ -832,7 +1220,8 @@ async function preflightFamily(
         );
 
       if (
-        barcodeMatches.length > 0
+        barcodeMatches.length >
+        0
       ) {
         return {
           ok:
@@ -878,7 +1267,8 @@ async function preflightFamily(
   }
 
   if (
-    existing.length === 0
+    existing.length ===
+    0
   ) {
     return {
       ok:
@@ -940,7 +1330,8 @@ function resolveExistingParent(
   }
 
   if (
-    productIds.length !== 1
+    productIds.length !==
+    1
   ) {
     return {
       ok:
@@ -987,7 +1378,9 @@ async function createDraftFamily(
       family
     );
 
-  if (!finalCheck.ok) {
+  if (
+    !finalCheck.ok
+  ) {
     return {
       action:
         "SKIPPED_COLLISION_OR_UNSAFE",
@@ -1006,16 +1399,14 @@ async function createDraftFamily(
     );
 
   /*
-  IMPORTANT CHANGE:
+  Old split families are cleanup work.
 
-  Old split families are cleanup
-  work.
-
-  They must NOT stop the full
-  catalogue reconciliation and
-  must NOT create another duplicate.
+  They must NOT stop the full catalogue
+  reconciliation and must NOT create another duplicate.
   */
-  if (!parentCheck.ok) {
+  if (
+    !parentCheck.ok
+  ) {
     return {
       action:
         "SKIPPED_SPLIT_PARENT",
@@ -1057,7 +1448,9 @@ async function createDraftFamily(
     family.optionName;
 
   /*
+  ==========================================================
   PARTIAL EXISTING FAMILY
+  ==========================================================
   */
   if (
     finalCheck.mode ===
@@ -1167,6 +1560,7 @@ async function createDraftFamily(
             barcode
             price
           }
+
           userErrors {
             field
             message
@@ -1256,7 +1650,7 @@ async function createDraftFamily(
     }
 
     /*
-    Verify every new SKU.
+    Verify every newly added SKU.
     */
     for (
       const item
@@ -1275,7 +1669,8 @@ async function createDraftFamily(
         );
 
       if (
-        matches.length !== 1
+        matches.length !==
+        1
       ) {
         throw new Error(
           `PARTIAL_VERIFY_SKU_COUNT ` +
@@ -1336,10 +1731,14 @@ async function createDraftFamily(
   }
 
   /*
+  ==========================================================
   ALL NEW FAMILY
 
-  Create one DRAFT product only.
+  Creates one DRAFT product only.
+  Publication guard deliberately ignores it until ACTIVE.
+  ==========================================================
   */
+
   const seenOptions =
     new Set();
 
@@ -1451,7 +1850,10 @@ async function createDraftFamily(
           title
           status
           vendor
-          variants(first: 100) {
+
+          variants(
+            first: 100
+          ) {
             nodes {
               id
               sku
@@ -1460,6 +1862,7 @@ async function createDraftFamily(
             }
           }
         }
+
         userErrors {
           field
           message
@@ -1480,7 +1883,7 @@ async function createDraftFamily(
 
     /*
     Internal PPL tags only.
-    Supplier name is NOT added.
+    Supplier name is NOT displayed to storefront customers.
     */
     tags: [
       "PPL controlled import",
@@ -1510,11 +1913,12 @@ async function createDraftFamily(
     );
 
   const result =
-    data.productSet;
+    data
+      ?.productSet;
 
   if (
     result
-      .userErrors
+      ?.userErrors
       ?.length
   ) {
     throw new Error(
@@ -1526,7 +1930,8 @@ async function createDraftFamily(
   }
 
   const product =
-    result.product;
+    result
+      ?.product;
 
   if (
     !product ||
@@ -1573,7 +1978,8 @@ async function createDraftFamily(
       );
 
     if (
-      matches.length !== 1
+      matches.length !==
+      1
     ) {
       throw new Error(
         `POST_CREATE_VARIANT_VERIFY_FAILED ${sku}`
@@ -1590,8 +1996,7 @@ async function createDraftFamily(
       throw new Error(
         `POST_CREATE_BARCODE_VERIFY_FAILED ${sku}`
       );
-    }
-  }
+    }  }
 
   /*
   Independent Shopify verification.
@@ -1613,7 +2018,8 @@ async function createDraftFamily(
       );
 
     if (
-      after.length !== 1 ||
+      after.length !==
+        1 ||
       after[0]
         .product
         .id !==
@@ -1677,12 +2083,12 @@ async function createDraftFamily(
 async function main() {
   console.log(
     "BUILD_MARKER " +
-      "PPL-CATALOGUE-WRITER-V3-FULL-SPLIT-SKIP"
+      "PPL-CATALOGUE-WRITER-V3.1-PUBLICATION-GUARD"
   );
 
   console.log(
     "MODE=" +
-      "FULL_ELIGIBLE_CATALOGUE_RECONCILIATION_DRAFT_ONLY"
+      "FULL_ELIGIBLE_CATALOGUE_RECONCILIATION_DRAFT_NEW_PRODUCTS_ACTIVE_PUBLICATION_REPAIR"
   );
 
   console.log(
@@ -1698,7 +2104,7 @@ async function main() {
   );
 
   console.log(
-    "PUBLISHING_ALLOWED=NO"
+    "PUBLISHING_ALLOWED=ACTIVE_CONTROLLED_REPAIR_ONLY"
   );
 
   const rows =
@@ -1714,7 +2120,10 @@ async function main() {
   const bySku =
     new Map();
 
-  for (const r of rows) {
+  for (
+    const r
+    of rows
+  ) {
     const sku =
       clean(
         r.ProductCode
@@ -1725,7 +2134,9 @@ async function main() {
     }
 
     if (
-      !bySku.has(sku)
+      !bySku.has(
+        sku
+      )
     ) {
       bySku.set(
         sku,
@@ -1734,8 +2145,12 @@ async function main() {
     }
 
     bySku
-      .get(sku)
-      .push(r);
+      .get(
+        sku
+      )
+      .push(
+        r
+      );
   }
 
   /*
@@ -1744,7 +2159,8 @@ async function main() {
   const safe =
     new Map();
 
-  let conflicts = 0;
+  let conflicts =
+    0;
 
   for (
     const [
@@ -1761,7 +2177,8 @@ async function main() {
       );
 
     if (
-      ids.size !== 1
+      ids.size !==
+      1
     ) {
       conflicts++;
       continue;
@@ -1801,7 +2218,9 @@ async function main() {
     of safe
   ) {
     const hard =
-      hardBlocked(r);
+      hardBlocked(
+        r
+      );
 
     if (hard) {
       hardBlockedCount++;
@@ -1815,7 +2234,9 @@ async function main() {
     }
 
     const excluded =
-      ordinaryExcluded(r);
+      ordinaryExcluded(
+        r
+      );
 
     if (excluded) {
       ordinaryExcludedCount++;
@@ -1841,7 +2262,9 @@ async function main() {
       continue;
     }
 
-    candidates.push(r);
+    candidates.push(
+      r
+    );
   }
 
   console.log(
@@ -1871,7 +2294,9 @@ async function main() {
     of candidates
   ) {
     const info =
-      familyInfo(r);
+      familyInfo(
+        r
+      );
 
     if (
       !familyMap.has(
@@ -1913,10 +2338,9 @@ async function main() {
       });
   }
 
-  const families =
-    [
-      ...familyMap.values()
-    ];
+  const families = [
+    ...familyMap.values()
+  ];
 
   console.log(
     `SAFE_FAMILIES=${families.length}`
@@ -1935,6 +2359,29 @@ async function main() {
 
   const auth =
     await shopifyAuth();
+
+  /*
+  ==========================================================
+  PUBLICATION GUARD - BEFORE WRITES
+  ==========================================================
+
+  Repairs anything that was previously made ACTIVE
+  but left unpublished.
+
+  Drafts remain untouched.
+  */
+  console.log(
+    "PUBLICATION_GUARD_BEFORE_START"
+  );
+
+  const publicationGuardBefore =
+    await repairActiveControlledPublications(
+      auth
+    );
+
+  console.log(
+    "PUBLICATION_GUARD_BEFORE_COMPLETE"
+  );
 
   let createdSkus =
     0;
@@ -2088,6 +2535,29 @@ async function main() {
     }
   }
 
+  /*
+  ==========================================================
+  PUBLICATION GUARD - AFTER WRITES
+  ==========================================================
+
+  Second pass ensures anything that became ACTIVE
+  during the run cannot remain unpublished.
+
+  Newly created DRAFT products are still ignored.
+  */
+  console.log(
+    "PUBLICATION_GUARD_AFTER_START"
+  );
+
+  const publicationGuardAfter =
+    await repairActiveControlledPublications(
+      auth
+    );
+
+  console.log(
+    "PUBLICATION_GUARD_AFTER_COMPLETE"
+  );
+
   console.log(
     "CONTROLLED_V3_WRITE_COMPLETE"
   );
@@ -2129,7 +2599,27 @@ async function main() {
   );
 
   console.log(
-    "PUBLISHED_PRODUCTS=0"
+    `PUBLICATION_GUARD_CHECKED_BEFORE=${publicationGuardBefore.checked}`
+  );
+
+  console.log(
+    `PUBLICATION_GUARD_REPAIRED_BEFORE=${publicationGuardBefore.repaired}`
+  );
+
+  console.log(
+    `PUBLICATION_GUARD_CHECKED_AFTER=${publicationGuardAfter.checked}`
+  );
+
+  console.log(
+    `PUBLICATION_GUARD_REPAIRED_AFTER=${publicationGuardAfter.repaired}`
+  );
+
+  console.log(
+    `PUBLICATION_GUARD_TOTAL_REPAIRED=` +
+      `${
+        publicationGuardBefore.repaired +
+        publicationGuardAfter.repaired
+      }`
   );
 }
 
