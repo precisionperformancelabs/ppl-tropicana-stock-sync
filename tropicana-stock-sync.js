@@ -4,17 +4,19 @@
  * PRECISION PERFORMANCE LABS
  * TROPSHIP STOCK SYNC
  *
- * BUILD: V7 - NO XML PARSER
+ * BUILD: V8 - FEED AUTHORITATIVE
  *
  * PURPOSE
  * -------
  * - Download Tropicana / TropShip stock feed by SFTP
  * - Read supplier SKU + stock WITHOUT fast-xml-parser
- * - Match only PPL products carrying approved Tropicana tags
+ * - Treat validated supplier-feed membership as TropShip authority
+ * - Match exact Shopify SKU
  * - Process ACTIVE products only
+ * - Protect genuine PPL / HIRO / KMT own-stock products
  * - Enable Shopify inventory tracking where required
  * - Ensure supplier inventory is at Tropicana Dropship
- * - Remove Tropicana inventory from own-stock location "30"
+ * - Remove TropShip inventory from own-stock location "30"
  * - Remove stale Syncee inventory location
  * - Update Shopify available quantity to supplier quantity
  * - Verify inventory writes by reading Shopify back
@@ -33,6 +35,7 @@
  * - Suspiciously small supplier feeds are blocked
  * - Invalid stock values are blocked
  * - Shopify writes are verified
+ * - Own-stock PPL / HIRO / KMT products are protected
  */
 
 const SFTP = require("ssh2-sftp-client");
@@ -56,19 +59,12 @@ const shop = process.env.SHOPIFY_STORE_DOMAIN;
 const apiVersion = "2026-07";
 
 const BUILD_MARKER =
-  "PPL-STOCK-SYNC-2026-09-29-V7-NO-XML-PARSER";
+  "PPL-STOCK-SYNC-2026-09-30-V8-FEED-AUTHORITATIVE";
 
 /*
  * SHOPIFY LOCATIONS
- *
- * 30 = PPL's own-stock location.
- * Tropicana products must NOT remain active here.
- *
- * Tropicana Dropship = supplier fulfilment location.
- *
- * Syncee = old supplier location which must not contribute
- * inventory to Tropicana products.
  */
+
 const OWN_30 =
   "gid://shopify/Location/120937251150";
 
@@ -79,13 +75,22 @@ const SYNCEE =
   "gid://shopify/Location/124613067086";
 
 /*
+ * Brands which this TropShip job must NEVER convert
+ * into supplier-stock products.
+ */
+const PROTECTED_OWN_STOCK_VENDORS = new Set([
+  "PRECISION PERFORMANCE LABS",
+  "PPL",
+  "HIRO",
+  "KMT"
+]);
+
+/*
  * Diagnostic SKUs.
- *
- * These are NOT the only SKUs synchronised.
- * They simply receive extra logging.
  */
 const TARGET_SKUS = new Set([
   "APP486",
+  "APP569",
   "PER458",
   "PER459",
   "PER460"
@@ -109,6 +114,49 @@ const normSku = value =>
   String(value ?? "")
     .trim()
     .toUpperCase();
+
+const normText = value =>
+  String(value ?? "")
+    .trim()
+    .toUpperCase();
+
+/* =========================================================
+   OWN-STOCK PROTECTION
+   ========================================================= */
+
+function isProtectedOwnStock(v) {
+  const vendor =
+    normText(v.product?.vendor);
+
+  if (
+    PROTECTED_OWN_STOCK_VENDORS.has(vendor)
+  ) {
+    return true;
+  }
+
+  /*
+   * Secondary protection using explicit own-stock tags.
+   *
+   * We deliberately do NOT protect a product merely because
+   * it currently has inventory at location 30. Some TropShip
+   * products were incorrectly assigned there previously.
+   */
+  const tags =
+    Array.isArray(v.product?.tags)
+      ? v.product.tags
+      : [];
+
+  return tags.some(tag => {
+    const t =
+      normText(tag);
+
+    return (
+      t === "PPL OWN STOCK" ||
+      t === "OWN STOCK" ||
+      t === "SUPPLIER:PPL"
+    );
+  });
+}
 
 /* =========================================================
    SHOPIFY AUTH
@@ -282,7 +330,6 @@ async function gql(
       );
 
       await sleep(waitMs);
-
       continue;
     }
 
@@ -310,18 +357,6 @@ async function gql(
    SUPPLIER FEED READER
    ========================================================= */
 
-/*
- * fast-xml-parser is deliberately NOT used.
- *
- * We only need two pieces of information:
- *
- * ProductCode
- * stock quantity
- *
- * Reading only those fields is considerably safer than
- * constructing a full XML tree from the supplier document.
- */
-
 function decodeXml(value) {
   return String(value ?? "")
     .replace(
@@ -339,9 +374,7 @@ function decodeXml(value) {
         const n =
           parseInt(hex, 16);
 
-        if (
-          !Number.isFinite(n)
-        ) {
+        if (!Number.isFinite(n)) {
           return whole;
         }
 
@@ -358,9 +391,7 @@ function decodeXml(value) {
         const n =
           parseInt(dec, 10);
 
-        if (
-          !Number.isFinite(n)
-        ) {
+        if (!Number.isFinite(n)) {
           return whole;
         }
 
@@ -405,9 +436,7 @@ function extractTag(
     return null;
   }
 
-  return decodeXml(
-    match[1]
-  );
+  return decodeXml(match[1]);
 }
 
 function prepareSupplierXml(
@@ -424,9 +453,7 @@ function prepareSupplierXml(
 
   let xml;
 
-  if (
-    Buffer.isBuffer(downloaded)
-  ) {
+  if (Buffer.isBuffer(downloaded)) {
     xml =
       downloaded.toString("utf8");
   } else {
@@ -446,20 +473,12 @@ function prepareSupplierXml(
     );
   }
 
-  /*
-   * Remove UTF-8 BOM.
-   */
   xml =
     xml.replace(
       /^\uFEFF/,
       ""
     );
 
-  /*
-   * Remove XML 1.0 illegal control characters.
-   *
-   * TAB, LF and CR are deliberately preserved.
-   */
   xml =
     xml.replace(
       /[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g,
@@ -475,9 +494,7 @@ function prepareSupplierXml(
   const trimmed =
     xml.trim();
 
-  if (
-    !trimmed.startsWith("<")
-  ) {
+  if (!trimmed.startsWith("<")) {
     throw new Error(
       `TROPICANA_FEED_NOT_XML ` +
       `first_chars=` +
@@ -496,15 +513,6 @@ function prepareSupplierXml(
   return xml;
 }
 
-/*
- * Find every ProductCode occurrence.
- *
- * We use the section from one ProductCode to the next
- * ProductCode as the search window for that SKU.
- *
- * This deliberately avoids relying on whether Tropicana
- * calls its parent node Product, Products, Item, etc.
- */
 function productCodePositions(
   xml
 ) {
@@ -556,9 +564,7 @@ function stockFromSegment(
         field
       );
 
-    if (
-      value !== null
-    ) {
+    if (value !== null) {
       found.push({
         field,
         value
@@ -566,17 +572,13 @@ function stockFromSegment(
     }
   }
 
-  if (
-    found.length === 0
-  ) {
+  if (found.length === 0) {
     throw new Error(
       `Unsafe stock fields for ${sku}: none`
     );
   }
 
-  if (
-    found.length > 1
-  ) {
+  if (found.length > 1) {
     throw new Error(
       `Unsafe stock fields for ${sku}: ` +
       `${found
@@ -661,13 +663,6 @@ function buildSupplierMap(
     `count=${positions.length}`
   );
 
-  /*
-   * This feed is expected to contain thousands of products.
-   *
-   * A tiny result indicates a truncated or fundamentally
-   * changed feed. In that situation we stop before touching
-   * Shopify.
-   */
   if (
     positions.length < 100
   ) {
@@ -705,13 +700,6 @@ function buildSupplierMap(
         ? next.start
         : xml.length;
 
-    /*
-     * Search only AFTER this ProductCode and BEFORE
-     * the next ProductCode.
-     *
-     * This prevents us from accidentally taking stock
-     * belonging to the previous product.
-     */
     const segment =
       xml.slice(
         current.afterCode,
@@ -734,13 +722,6 @@ function buildSupplierMap(
       );
 
       blockedRows++;
-
-      /*
-       * Fail closed.
-       *
-       * We do not silently ignore a product whose stock
-       * representation is unsafe.
-       */
       throw e;
     }
 
@@ -788,10 +769,6 @@ function buildSupplierMap(
     }
   }
 
-  /*
-   * Same supplier SKU with conflicting quantities:
-   * remove it entirely rather than guessing.
-   */
   for (
     const sku of
     conflictingDuplicates
@@ -904,25 +881,8 @@ async function supplierFeed() {
 }
 
 /* =========================================================
-   SHOPIFY PRODUCT IDENTIFICATION
+   INVENTORY HELPERS
    ========================================================= */
-
-function isTropicanaVariant(v) {
-  const tags =
-    Array.isArray(
-      v.product?.tags
-    )
-      ? v.product.tags
-      : [];
-
-  return tags.some(
-    tag =>
-      /^(Supplier:Tropicana|Tropicana Feed|Tropicana Dropship)$/i
-        .test(
-          String(tag).trim()
-        )
-  );
-}
 
 function availableAt(level) {
   if (!level) {
@@ -1013,6 +973,7 @@ async function variants(
             id
             title
             status
+            vendor
             tags
           }
         }
@@ -1215,7 +1176,7 @@ async function setTracking(
 }
 
 /* =========================================================
-   SET EXISTING INVENTORY QUANTITY
+   SET INVENTORY QUANTITY
    ========================================================= */
 
 async function setQuantity(
@@ -1485,7 +1446,7 @@ async function deactivateLocation(
 
   /*
    * STEP 1:
-   * Download + validate supplier feed BEFORE Shopify writes.
+   * Download and validate supplier feed.
    */
   const feed =
     await supplierFeed();
@@ -1512,7 +1473,7 @@ async function deactivateLocation(
 
   /*
    * STEP 2:
-   * Authenticate with Shopify only after feed is safe.
+   * Authenticate only after supplier feed is safe.
    */
   const accessToken =
     await token();
@@ -1523,7 +1484,7 @@ async function deactivateLocation(
 
   /*
    * STEP 3:
-   * Load Shopify variants.
+   * Load every Shopify variant.
    */
   const all =
     await variants(
@@ -1536,7 +1497,7 @@ async function deactivateLocation(
   );
 
   /*
-   * Extra diagnostics for known SKUs.
+   * Diagnostics.
    */
   for (
     const sku of
@@ -1566,8 +1527,11 @@ async function deactivateLocation(
         `title=${JSON.stringify(
           v.product?.title || ""
         )} ` +
+        `vendor=${JSON.stringify(
+          v.product?.vendor || ""
+        )} ` +
         `status=${v.product?.status} ` +
-        `tropicana=${isTropicanaVariant(v)} ` +
+        `protected=${isProtectedOwnStock(v)} ` +
         `tracked=${v.inventoryItem?.tracked} ` +
         `dropship=${availableAt(
           v.inventoryItem?.dropship
@@ -1583,47 +1547,85 @@ async function deactivateLocation(
   }
 
   /*
-   * Build SKU -> Shopify variant map.
+   * =====================================================
+   * V8 CRITICAL FIX
+   * =====================================================
    *
-   * Only Tropicana-tagged Shopify products are eligible.
+   * V7 required Shopify Tropicana tags.
+   *
+   * That was wrong because valid Tropicana-feed SKUs could
+   * exist in Shopify without one of those exact tags.
+   *
+   * V8 therefore uses:
+   *
+   *     VALIDATED SUPPLIER FEED SKU
+   *              +
+   *     EXACT SHOPIFY SKU
+   *
+   * as the TropShip inventory authority.
+   *
+   * Genuine PPL / HIRO / KMT own-stock products remain
+   * protected and are excluded.
    */
+
   const bySku =
     new Map();
 
-  const tropicanaStoreSkus =
+  const shopifySkus =
     new Set();
+
+  const protectedSkus =
+    new Set();
+
+  let blankShopifySkus = 0;
 
   for (
     const v of all
   ) {
-    if (
-      !isTropicanaVariant(v)
-    ) {
-      continue;
-    }
-
     const sku =
       normSku(v.sku);
 
     if (!sku) {
+      blankShopifySkus++;
       continue;
     }
 
-    tropicanaStoreSkus.add(
+    shopifySkus.add(
       sku
     );
 
     /*
-     * CRITICAL:
+     * Missing supplier SKU = DO NOTHING.
      *
-     * A Shopify SKU missing from the supplier feed is NOT
-     * automatically set to zero.
-     *
-     * Missing feed data is not proof of zero stock.
+     * We never interpret absence from the feed as zero.
      */
     if (
       !feed.has(sku)
     ) {
+      continue;
+    }
+
+    /*
+     * Protect genuine PPL own-stock products.
+     */
+    if (
+      isProtectedOwnStock(v)
+    ) {
+      protectedSkus.add(
+        sku
+      );
+
+      console.log(
+        `PROTECTED_OWN_STOCK ` +
+        `sku=${sku} ` +
+        `vendor=${JSON.stringify(
+          v.product?.vendor || ""
+        )} ` +
+        `title=${JSON.stringify(
+          v.product?.title || ""
+        )}`
+      );
+
       continue;
     }
 
@@ -1645,27 +1647,28 @@ async function deactivateLocation(
     [...feed.keys()]
       .filter(
         sku =>
-          !tropicanaStoreSkus
-            .has(sku)
+          !shopifySkus.has(sku)
       );
 
-  const shopifyWithoutFeed =
-    [...tropicanaStoreSkus]
+  const shopifyFeedMatches =
+    [...feed.keys()]
       .filter(
         sku =>
-          !feed.has(sku)
+          shopifySkus.has(sku)
       );
 
   console.log(
     `MATCH_AUDIT ` +
     `feed=${feed.size} ` +
-    `tropicana_shopify_skus=${tropicanaStoreSkus.size} ` +
-    `matched=${bySku.size} ` +
+    `shopify_unique_skus=${shopifySkus.size} ` +
+    `feed_shopify_matches=${shopifyFeedMatches.length} ` +
+    `eligible_sync_skus=${bySku.size} ` +
+    `protected_own_stock_skus=${protectedSkus.size} ` +
     `feed_without_shopify=${feedWithoutShopify.length} ` +
-    `shopify_without_feed=${shopifyWithoutFeed.length}`
+    `blank_shopify_skus=${blankShopifySkus}`
   );
 
-  let changed = 0;
+  let quantityChanged = 0;
   let unchanged = 0;
   let blocked = 0;
 
@@ -1674,20 +1677,20 @@ async function deactivateLocation(
   let ownStockDeactivated = 0;
   let synceeDeactivated = 0;
 
+  let inactiveOnly = 0;
+  let duplicateActiveBlocked = 0;
+  let missingInventoryItem = 0;
+
   /*
    * STEP 4:
-   * Synchronise eligible SKUs.
+   * Synchronise every safe supplier-feed SKU which has
+   * exactly one ACTIVE, non-protected Shopify match.
    */
   for (
     const [sku, list]
     of bySku.entries()
   ) {
-    /*
-     * We only write when exactly ONE ACTIVE Tropicana
-     * Shopify variant exists for this SKU.
-     *
-     * Duplicate ACTIVE SKU = unsafe = block.
-     */
+
     const active =
       list.filter(
         v =>
@@ -1696,18 +1699,39 @@ async function deactivateLocation(
           "ACTIVE"
       );
 
+    /*
+     * No ACTIVE product:
+     * do not write inventory.
+     */
     if (
-      active.length !== 1
+      active.length === 0
     ) {
-      console.error(
-        `BLOCKED ` +
+      console.log(
+        `SKIPPED_INACTIVE ` +
         `sku=${sku} ` +
-        `active_matches=${active.length} ` +
-        `all_tropicana_matches=${list.length}`
+        `shopify_matches=${list.length}`
       );
 
-      blocked++;
+      inactiveOnly++;
+      continue;
+    }
 
+    /*
+     * More than one ACTIVE Shopify variant with same SKU:
+     * unsafe, so block rather than guessing.
+     */
+    if (
+      active.length > 1
+    ) {
+      console.error(
+        `BLOCKED_DUPLICATE_ACTIVE_SKU ` +
+        `sku=${sku} ` +
+        `active_matches=${active.length} ` +
+        `all_matches=${list.length}`
+      );
+
+      duplicateActiveBlocked++;
+      blocked++;
       continue;
     }
 
@@ -1723,17 +1747,14 @@ async function deactivateLocation(
         `reason=MISSING_INVENTORY_ITEM`
       );
 
+      missingInventoryItem++;
       blocked++;
-
       continue;
     }
 
     const wanted =
       feed.get(sku);
 
-    /*
-     * Final quantity sanity check immediately before writes.
-     */
     if (
       !Number.isSafeInteger(wanted) ||
       wanted < 0 ||
@@ -1747,7 +1768,6 @@ async function deactivateLocation(
       );
 
       blocked++;
-
       continue;
     }
 
@@ -1757,7 +1777,7 @@ async function deactivateLocation(
     try {
 
       /*
-       * Inventory tracking must be ON.
+       * Tracking must be enabled.
        */
       if (
         !v.inventoryItem.tracked
@@ -1784,6 +1804,18 @@ async function deactivateLocation(
             ?.dropship
         );
 
+      const ownCurrent =
+        availableAt(
+          v.inventoryItem
+            ?.ownStock
+        );
+
+      const synceeCurrent =
+        availableAt(
+          v.inventoryItem
+            ?.syncee
+        );
+
       if (
         TARGET_SKUS.has(sku)
       ) {
@@ -1792,18 +1824,13 @@ async function deactivateLocation(
           `sku=${sku} ` +
           `wanted=${wanted} ` +
           `dropship=${dropshipCurrent} ` +
-          `own30=${availableAt(
-            v.inventoryItem?.ownStock
-          )} ` +
-          `syncee=${availableAt(
-            v.inventoryItem?.syncee
-          )}`
+          `own30=${ownCurrent} ` +
+          `syncee=${synceeCurrent}`
         );
       }
 
       /*
-       * If Tropicana Dropship is not active,
-       * activate it with the supplier quantity.
+       * Activate Tropicana Dropship if necessary.
        */
       if (
         dropshipCurrent === null
@@ -1821,7 +1848,7 @@ async function deactivateLocation(
         );
 
         dropshipActivated++;
-        changed++;
+        quantityChanged++;
 
         productChanged = true;
         dropshipCurrent = wanted;
@@ -1833,8 +1860,7 @@ async function deactivateLocation(
       ) {
 
         /*
-         * Existing Tropicana location:
-         * update only if supplier quantity differs.
+         * Correct stale Tropicana quantity.
          */
         await setQuantity(
           accessToken,
@@ -1853,7 +1879,7 @@ async function deactivateLocation(
           `to=${wanted}`
         );
 
-        changed++;
+        quantityChanged++;
 
         productChanged = true;
         dropshipCurrent = wanted;
@@ -1862,11 +1888,11 @@ async function deactivateLocation(
       }
 
       /*
-       * Supplier products must not remain active
-       * at PPL own-stock location 30.
+       * Because this SKU is present in the validated supplier
+       * feed and has passed own-stock protection, it is a
+       * TropShip item.
        *
-       * This DOES NOT affect genuine PPL own-stock products,
-       * because only Tropicana-tagged variants reach here.
+       * It must therefore not remain active at location 30.
        */
       if (
         v.inventoryItem
@@ -1886,15 +1912,13 @@ async function deactivateLocation(
         );
 
         ownStockDeactivated++;
-
         productChanged = true;
 
         await sleep(250);
       }
 
       /*
-       * Old Syncee stock must not contribute to
-       * Tropicana-tagged products.
+       * Remove stale Syncee location.
        */
       if (
         v.inventoryItem
@@ -1914,18 +1938,18 @@ async function deactivateLocation(
         );
 
         synceeDeactivated++;
-
         productChanged = true;
 
         await sleep(250);
       }
 
       /*
-       * Extra end-to-end verification for target SKUs.
+       * FINAL READ-BACK.
+       *
+       * Unlike V7, this is performed for EVERY changed SKU,
+       * not merely the diagnostic target SKUs.
        */
-      if (
-        TARGET_SKUS.has(sku)
-      ) {
+      if (productChanged) {
         const afterDropship =
           await readAvailable(
             accessToken,
@@ -1951,19 +1975,11 @@ async function deactivateLocation(
             SYNCEE
           );
 
-        console.log(
-          `TARGET_AFTER ` +
-          `sku=${sku} ` +
-          `dropship=${afterDropship} ` +
-          `own30=${afterOwn30} ` +
-          `syncee=${afterSyncee}`
-        );
-
         if (
           afterDropship !== wanted
         ) {
           throw new Error(
-            `Final target verification failed ` +
+            `FINAL_VERIFY_DROPSHIP_FAILED ` +
             `sku=${sku} ` +
             `wanted=${wanted} ` +
             `actual=${afterDropship}`
@@ -1974,9 +1990,9 @@ async function deactivateLocation(
           afterOwn30 !== null
         ) {
           throw new Error(
-            `Final target verification failed ` +
+            `FINAL_VERIFY_LOCATION_30_FAILED ` +
             `sku=${sku} ` +
-            `location=30 still active`
+            `actual=${afterOwn30}`
           );
         }
 
@@ -1984,15 +2000,57 @@ async function deactivateLocation(
           afterSyncee !== null
         ) {
           throw new Error(
-            `Final target verification failed ` +
+            `FINAL_VERIFY_SYNCEE_FAILED ` +
             `sku=${sku} ` +
-            `location=Syncee still active`
+            `actual=${afterSyncee}`
           );
         }
+
+        console.log(
+          `FINAL_VERIFIED ` +
+          `sku=${sku} ` +
+          `dropship=${afterDropship} ` +
+          `own30=${afterOwn30} ` +
+          `syncee=${afterSyncee}`
+        );
       }
 
       if (!productChanged) {
         unchanged++;
+      }
+
+      if (
+        TARGET_SKUS.has(sku)
+      ) {
+        const finalDropship =
+          await readAvailable(
+            accessToken,
+            v.inventoryItem.id,
+            TROPSHIP
+          );
+
+        const finalOwn =
+          await readAvailable(
+            accessToken,
+            v.inventoryItem.id,
+            OWN_30
+          );
+
+        const finalSyncee =
+          await readAvailable(
+            accessToken,
+            v.inventoryItem.id,
+            SYNCEE
+          );
+
+        console.log(
+          `TARGET_AFTER ` +
+          `sku=${sku} ` +
+          `wanted=${wanted} ` +
+          `dropship=${finalDropship} ` +
+          `own30=${finalOwn} ` +
+          `syncee=${finalSyncee}`
+        );
       }
 
     } catch (e) {
@@ -2006,16 +2064,24 @@ async function deactivateLocation(
     }
   }
 
+  /*
+   * STEP 5:
+   * Final run summary.
+   */
   console.log(
     `SYNC_COMPLETE ` +
-    `changed=${changed} ` +
+    `quantity_changed=${quantityChanged} ` +
     `unchanged=${unchanged} ` +
     `tracking_enabled=${trackingEnabled} ` +
     `dropship_activated=${dropshipActivated} ` +
     `own_location_deactivated=${ownStockDeactivated} ` +
     `syncee_deactivated=${synceeDeactivated} ` +
+    `inactive_only=${inactiveOnly} ` +
+    `duplicate_active_blocked=${duplicateActiveBlocked} ` +
+    `missing_inventory_item=${missingInventoryItem} ` +
+    `protected_own_stock=${protectedSkus.size} ` +
     `blocked=${blocked} ` +
-    `matched_skus=${bySku.size}`
+    `eligible_sync_skus=${bySku.size}`
   );
 
 })().catch(e => {
